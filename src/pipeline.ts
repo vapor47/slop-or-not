@@ -47,11 +47,18 @@ export class Pipeline {
     } catch {
       console.error(JSON.stringify({ event: 'metrics_failure', question: q.id, role }));
     }
-    const hash = { sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length };
-    this.repo.saveMetrics(q, role, run, hash, metrics);
-    const original = this.repo.metrics(q.id, 'original');
-    if (role === 'generated' && metrics && original?.dhash)
-      this.repo.track(q, { dhash_distance: hamming(String(original.dhash), metrics.dhash) });
+    try {
+      const hash = {
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+        bytes: bytes.length,
+      };
+      this.repo.saveMetrics(q, role, run, hash, metrics);
+      const original = this.repo.metrics(q.id, 'original');
+      if (role === 'generated' && metrics && original?.dhash)
+        this.repo.track(q, { dhash_distance: hamming(String(original.dhash), metrics.dhash) });
+    } catch {
+      console.error(JSON.stringify({ event: 'metrics_failure', question: q.id, role }));
+    }
   }
   claim(): Question | undefined {
     return this.repo.transaction(() => {

@@ -97,12 +97,11 @@ export class Repository {
         sharpness REAL, colorfulness REAL, measured_at INTEGER NOT NULL, PRIMARY KEY(question_id, role));`);
     this.transaction(() => {
       for (const step of ['describe', 'generate'] as const) {
-        const latest = this.db
-          .prepare(
-            'SELECT text FROM prompt_templates WHERE step=? AND name=? ORDER BY version DESC LIMIT 1',
-          )
-          .get(step, DEFAULT_TEMPLATES[step].name);
-        if (latest?.text !== DEFAULT_TEMPLATES[step].text)
+        // Seed only text never seen before, so a later runtime edit of the same name is not reverted.
+        const seeded = this.db
+          .prepare('SELECT 1 FROM prompt_templates WHERE step=? AND name=? AND text=?')
+          .get(step, DEFAULT_TEMPLATES[step].name, DEFAULT_TEMPLATES[step].text);
+        if (!seeded)
           this.addTemplate(step, DEFAULT_TEMPLATES[step].name, DEFAULT_TEMPLATES[step].text);
       }
     });
@@ -379,6 +378,8 @@ export class Repository {
       q.due = this.now();
       q.lease = 0;
       this.save('questions', q);
+      // failed_at reflects the current outcome; earlier failures remain in generation_runs.
+      this.track(q, { failed_at: null });
       return q;
     });
   }

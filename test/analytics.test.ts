@@ -87,6 +87,11 @@ test('default prompt templates are seeded once and versioned immutably', () => {
     const latest = f.repo.activeTemplate('generate');
     assert.deepEqual([latest.version, latest.text], [2, 'A candid photograph. ']);
     assert.equal(f.repo.template(generate.id).active, 0);
+    // A runtime edit is not reverted by re-seeding the unchanged code default on restart.
+    const runtime = f.repo.addTemplate('generate', 'default', 'Runtime prefix. ');
+    new Repository(join(f.dir, 'test.sqlite'), 10000, f.repo.now).db.close();
+    assert.equal(f.repo.activeTemplate('generate').id, runtime.id);
+    assert.equal(f.repo.db.prepare('SELECT COUNT(*) AS n FROM prompt_templates').get()!.n, 5);
   } finally {
     f.close();
   }
@@ -214,6 +219,7 @@ test('temporary and permanent failures are recorded per attempt', async () => {
     assert.ok(analytics(f.repo, q.id).failed_at);
     // A manual retry records another run in the next retry cycle.
     f.repo.retry(q.id);
+    assert.equal(analytics(f.repo, q.id).failed_at, null);
     await pipe.tick();
     assert.deepEqual(
       runs(f.repo, q.id)
@@ -490,6 +496,32 @@ test('runs interrupted by a crash are finalised when the lease expires', async (
         ['describe', 2, 'succeeded', null],
         ['generate', 4, 'failed', 'interrupted'],
       ],
+    );
+  } finally {
+    f.close();
+  }
+});
+test('metrics storage errors never fail the question', async () => {
+  const f = fixture();
+  try {
+    const q = queued(f);
+    await f.store.put(q.original, Buffer.from('original'));
+    f.repo.saveMetrics = () => {
+      throw new Error('disk full');
+    };
+    const pipe = new Pipeline(
+      f.repo,
+      f.store,
+      fakeDescriptor(async () => 'A lamp.'),
+      fakeGenerator(async () => Buffer.from('generated')),
+      async (b) => b,
+    );
+    await pipe.tick();
+    await pipe.tick();
+    assert.equal(f.repo.get<Question>('questions', q.id)!.state, 'ready');
+    assert.deepEqual(
+      runs(f.repo, q.id).map((r) => r.status),
+      ['succeeded', 'succeeded'],
     );
   } finally {
     f.close();
