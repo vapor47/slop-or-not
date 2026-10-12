@@ -6,6 +6,9 @@ import { Auth } from './auth.ts';
 import { HttpError } from './types.ts';
 import type { Game, Question, ImageStore } from './types.ts';
 import type { Pipeline, Normalizer } from './pipeline.ts';
+import { QuotaError, IMAGE_ESTIMATE } from './quota.ts';
+import { RATE_LIMITS, clientIp, limit } from './ratelimit.ts';
+import type { RateLimits } from './ratelimit.ts';
 const MAX = 10 * 1024 * 1024;
 async function body(req: IncomingMessage, limit: number) {
   const chunks: Buffer[] = [];
@@ -42,7 +45,10 @@ export function app(
   pipeline: Pipeline | null,
   normalize: Normalizer | null,
   origin: string,
+  options: { ipHeader?: string; rateLimits?: RateLimits } = {},
 ) {
+  const quota = repo.quota,
+    limits = options.rateLimits ?? RATE_LIMITS;
   const publicDir = new URL('../public/', import.meta.url);
   return createServer(async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
@@ -55,7 +61,8 @@ export function app(
     try {
       const url = new URL(req.url || '/', origin),
         path = url.pathname,
-        method = req.method || 'GET';
+        method = req.method || 'GET',
+        ip = clientIp(req, options.ipHeader);
       if (
         !['GET', 'HEAD'].includes(method) &&
         (req.headers.origin !== origin || req.headers['x-slop-request'] !== '1')
@@ -66,6 +73,7 @@ export function app(
           status: 'ok',
           generationConfigured: Boolean(pipeline),
           storageConfigured: Boolean(store),
+          quota: quota.health(),
         });
       if (path === '/api/login' && method === 'POST') {
         const b = await jsonBody(req);
@@ -84,9 +92,20 @@ export function app(
               .list<Game>('games')
               .filter((g) => !g.deleted && repo.now() < (g.published ?? g.created) + WEEK),
             budget: repo.budget(),
+            usage: quota.usage(),
             generationConfigured: Boolean(pipeline),
             storageConfigured: Boolean(store),
           });
+        if (path === '/api/owner/usage' && method === 'GET') return json(res, quota.usage());
+        // Kill switches take effect immediately, without a restart or redeploy.
+        if (path === '/api/owner/switches' && method === 'POST') {
+          const b = await jsonBody(req);
+          if (typeof b.generationDisabled === 'boolean')
+            quota.setSwitch('generation_disabled', b.generationDisabled);
+          if (typeof b.storageReadOnly === 'boolean')
+            quota.setSwitch('storage_read_only', b.storageReadOnly);
+          return json(res, quota.usage());
+        }
         if (path === '/api/owner/games' && method === 'POST')
           return json(res, repo.create(field(await jsonBody(req), 'title')), 201);
         const gm = path.match(/^\/api\/owner\/games\/([\w-]+)(?:\/(publish|questions))?$/);
@@ -116,6 +135,11 @@ export function app(
               throw new HttpError(400, 'Upload a JPEG, PNG, or WebP photo.');
             if (Number(req.headers['content-length']) > MAX)
               throw new HttpError(413, 'Photo exceeds the 10 MB limit.');
+            // Refuse before reserving or reading the body: the original and generated image both
+            // need storage, and the upload is only useful if generation can run.
+            const blocked =
+              quota.generationBlocked() ?? quota.storageBlocked(2 * IMAGE_ESTIMATE, 2);
+            if (blocked) throw new QuotaError(503, blocked);
             const q = repo.acceptUpload(game.id); // Durable reservation before reading the upload.
             q.descriptorModel = pipeline.descriptor.model;
             q.generatorModel = pipeline.generator.model;
@@ -150,6 +174,8 @@ export function app(
           }
           if (method === 'POST' && qm[2] === 'retry') {
             if (!pipeline) throw new HttpError(503, 'Generation is not configured.');
+            const blocked = quota.generationBlocked();
+            if (blocked) throw new QuotaError(503, blocked);
             return json(res, repo.retry(q.id));
           }
           if (method === 'GET' && qm[2] === 'image') {
@@ -161,6 +187,10 @@ export function app(
       }
       const invite = path.match(/^\/api\/invites\/([\w-]+)(?:\/(start))?$/);
       if (invite) {
+        if (method === 'POST' && invite[2] === 'start') {
+          limit(repo, `start:ip:${ip}`, limits.start.ip);
+          limit(repo, `start:invite:${invite[1]}`, limits.start.invite);
+        } else limit(repo, `invite:ip:${ip}`, limits.invite.ip);
         const game = repo.invite(invite[1]);
         if (method === 'GET' && !invite[2])
           return json(res, {
@@ -175,6 +205,9 @@ export function app(
         /^\/api\/plays\/([\w-]+)(?:\/(answer|next|images)(?:\/(\d+)\/([01]))?)?$/,
       );
       if (play) {
+        const group = play[2] === 'images' ? 'image' : 'play';
+        limit(repo, `${group}:ip:${ip}`, limits[group].ip);
+        limit(repo, `${group}:play:${play[1]}`, limits[group].play);
         if (method === 'GET' && !play[2]) return json(res, repo.view(repo.play(play[1])));
         if (method === 'POST' && ['answer', 'next'].includes(play[2])) {
           const b = await jsonBody(req),
@@ -197,11 +230,19 @@ export function app(
           const item = p.questions[index],
             q = repo.get<Question>('questions', item.id);
           if (!q || !store) throw new HttpError(503, 'Image unavailable. Retry images.');
-          const bytes = await store.get(side === item.ai ? q.generated : q.original);
+          // Load both images of the pair so response timing (cache hit or R2 read) never
+          // depends on which side is the AI image.
+          const [original, generated] = await Promise.all([
+            store.get(q.original),
+            store.get(q.generated),
+          ]);
           // Recheck expiry after the storage request, too.
-          repo.game(p.game);
+          const game = repo.game(p.game);
+          const ttl = Math.floor(((game.published ?? game.created) + WEEK - repo.now()) / 1000);
+          // Play URLs are per playthrough and never change, so a private browser copy is safe.
+          res.setHeader('Cache-Control', `private, max-age=${Math.max(0, Math.min(86400, ttl))}`);
           res.setHeader('Content-Type', 'image/jpeg');
-          return res.end(bytes);
+          return res.end(side === item.ai ? generated : original);
         }
       }
       if (path.startsWith('/api/')) throw new HttpError(404, 'Unavailable endpoint.');

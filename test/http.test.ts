@@ -122,7 +122,7 @@ test('HTTP creator login → upload → processing → invite → play → score
     const position = repo.play(start.id).questions[0].ai;
     const image = await request(start.question.images[position]);
     assert.equal(await image.text(), 'fake');
-    assert.equal(image.headers.get('cache-control'), 'no-store');
+    assert.equal(image.headers.get('cache-control'), 'private, max-age=86400');
     assert.equal(JSON.stringify(start).includes('generator-test'), false);
     assert.equal('ai' in start.question, false);
     const answered = await (

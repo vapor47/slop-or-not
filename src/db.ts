@@ -3,6 +3,8 @@ import { randomBytes, randomInt } from 'node:crypto';
 import { HttpError } from './types.ts';
 import type { Game, Question, Play, PromptTemplate, Step, ImageMetrics } from './types.ts';
 import { DEFAULT_TEMPLATES } from './prompts.ts';
+import { Quota, QuotaError, DEFAULT_LIMITS, IMAGE_ESTIMATE, NEURONS_EXHAUSTED } from './quota.ts';
+import type { Limits } from './quota.ts';
 export const WEEK = 7 * 86400000;
 export const token = () => randomBytes(24).toString('base64url');
 type Value = string | number | null;
@@ -47,11 +49,13 @@ export class Repository {
   now: () => number;
   descriptorUnits: number;
   generatorUnits: number;
+  quota: Quota;
   constructor(
     path: string,
     dailyBudget = 9000,
     now = Date.now,
     units = { descriptor: 200, generator: 60 },
+    limits: Partial<Limits> = {},
   ) {
     this.db = new DatabaseSync(path);
     this.dailyBudget = dailyBudget;
@@ -67,7 +71,8 @@ export class Repository {
       CREATE TABLE IF NOT EXISTS budget(day TEXT PRIMARY KEY, reserved INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS garbage(key TEXT PRIMARY KEY, delete_after INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, expires INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS login_limits(ip TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS login_limits(ip TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS rate_limits(bucket TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL);`);
     // Analytics tables are append-only and are never touched by expiry; see README "Analytics and retention".
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS prompt_templates(id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,6 +100,25 @@ export class Repository {
         role TEXT NOT NULL CHECK(role IN ('original','generated')), run_id INTEGER, sha256 TEXT NOT NULL,
         bytes INTEGER NOT NULL, width INTEGER, height INTEGER, dhash TEXT, brightness REAL, contrast REAL,
         sharpness REAL, colorfulness REAL, measured_at INTEGER NOT NULL, PRIMARY KEY(question_id, role));`);
+    this.quota = new Quota(this.db, now, { ...DEFAULT_LIMITS, ...limits, neurons: dailyBudget });
+    this.transaction(() => {
+      // Neuron reservations moved from the legacy budget table into the quota ledger.
+      this.db.exec(`INSERT OR IGNORE INTO quota_usage SELECT 'neurons', day, reserved FROM budget;
+        DELETE FROM budget;`);
+      // Track objects stored before the ledger existed, using measured sizes or a safe estimate.
+      for (const [role, states] of [
+        ['original', "('describe','generate','ready','failed')"],
+        ['generated', "('ready')"],
+      ])
+        this.db
+          .prepare(
+            `INSERT OR IGNORE INTO stored_objects(key, bytes, stored_at)
+            SELECT json_extract(q.data,'$.${role}'), COALESCE(m.bytes, ?), ? FROM questions q
+            LEFT JOIN image_metrics m ON m.question_id=q.id AND m.role='${role}'
+            WHERE json_extract(q.data,'$.state') IN ${states}`,
+          )
+          .run(IMAGE_ESTIMATE, now());
+    });
     this.transaction(() => {
       for (const step of ['describe', 'generate'] as const) {
         // Seed only text never seen before, so a later runtime edit of the same name is not reverted.
@@ -265,19 +289,12 @@ export class Repository {
   day() {
     return new Date(this.now()).toISOString().slice(0, 10);
   }
+  // Neurons go through the shared quota gate; reservations are per UTC day.
   reserve(units: number) {
-    const day = this.day();
-    this.db.prepare('INSERT OR IGNORE INTO budget VALUES(?,0)').run(day);
-    const result = this.db
-      .prepare('UPDATE budget SET reserved=reserved+? WHERE day=? AND reserved+?<=?')
-      .run(units, day, units, this.dailyBudget);
-    if (!result.changes)
-      throw new HttpError(429, 'Generation budget exhausted. Try again after midnight UTC.');
-    return day;
+    return this.quota.reserve('neurons', units, NEURONS_EXHAUSTED, 429);
   }
   budget() {
-    const row = this.db.prepare('SELECT reserved FROM budget WHERE day=?').get(this.day());
-    return { limit: this.dailyBudget, reserved: Number(row?.reserved || 0), resets: '00:00 UTC' };
+    return { limit: this.dailyBudget, reserved: this.quota.used('neurons'), resets: '00:00 UTC' };
   }
   garbage(key: string) {
     this.db.prepare('INSERT OR REPLACE INTO garbage VALUES(?,?)').run(key, this.now() + 10 * 60000);
@@ -286,9 +303,7 @@ export class Repository {
     this.transaction(() => {
       const q = this.get<Question>('questions', id);
       if (!q || q.state !== 'uploading') return;
-      this.db
-        .prepare('UPDATE budget SET reserved=MAX(0,reserved-?) WHERE day=?')
-        .run(this.cost(q), q.reservationDay);
+      this.quota.release('neurons', q.reservationDay, this.cost(q));
       this.garbage(q.original);
       this.garbage(q.generated);
       this.db.prepare('DELETE FROM questions WHERE id=?').run(id);
@@ -314,6 +329,11 @@ export class Repository {
     return this.game(game.id);
   }
   create(title: string) {
+    if (this.quota.liveGames() >= this.quota.limits.liveGames)
+      throw new QuotaError(
+        429,
+        'The live game limit is reached. Delete or wait for games to expire.',
+      );
     const game: Game = {
       id: token(),
       title: title.trim().slice(0, 80) || 'Slop or Not',
@@ -330,6 +350,8 @@ export class Repository {
       this.game(gameId, true);
       if (this.list<Question>('questions', gameId).length >= 10)
         throw new HttpError(400, 'A game can contain up to 10 questions.');
+      if (this.quota.liveQuestions() >= this.quota.limits.liveQuestions)
+        throw new QuotaError(429, 'The live question limit is reached. Wait for games to expire.');
       // Reserve four attempts at both steps: 200 description + 60 generation neurons per attempt.
       const reservationDay = this.reserve(4 * (this.descriptorUnits + this.generatorUnits)),
         id = token();
@@ -490,6 +512,7 @@ export class Repository {
       }
       this.db.prepare('DELETE FROM sessions WHERE expires<?').run(this.now());
       this.db.prepare('DELETE FROM login_limits WHERE expires<?').run(this.now());
+      this.db.prepare('DELETE FROM rate_limits WHERE expires<?').run(this.now());
     });
   }
 }
