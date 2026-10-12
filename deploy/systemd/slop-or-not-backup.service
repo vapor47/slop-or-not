@@ -1,0 +1,19 @@
+[Unit]
+Description=Back up the Slop or Not SQLite database to R2
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+
+[Service]
+Type=oneshot
+# Runs as the app user so it never leaves root-owned -wal/-shm files behind.
+User=slop
+Group=slop
+ExecStart=/opt/slop-or-not/app/deploy/backup.sh
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/data
