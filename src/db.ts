@@ -187,6 +187,14 @@ export class Repository {
         id,
       );
   }
+  interruptRuns(questionId: string) {
+    this.db
+      .prepare(
+        `UPDATE generation_runs SET status='failed', error_kind='temporary', error='interrupted',
+        finished_at=? WHERE question_id=? AND status='running'`,
+      )
+      .run(this.now(), questionId);
+  }
   saveMetrics(
     q: Question,
     role: 'original' | 'generated',

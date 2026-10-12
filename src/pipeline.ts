@@ -62,6 +62,8 @@ export class Pipeline {
           q.lease > this.repo.now()
         )
           continue;
+        // Unleased and due: any run still marked running was interrupted by a crash or restart.
+        this.repo.interruptRuns(q.id);
         try {
           this.repo.game(q.game, true);
         } catch {

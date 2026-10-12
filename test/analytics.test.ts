@@ -437,3 +437,61 @@ test('existing databases migrate additively and resume queued questions', async 
     f.close();
   }
 });
+test('runs interrupted by a crash are finalised when the lease expires', async () => {
+  const f = fixture();
+  try {
+    const q = queued(f);
+    await f.store.put(q.original, Buffer.from('original'));
+    // The first process never returns from the provider call (crash mid-call).
+    const crashed = new Pipeline(
+      f.repo,
+      f.store,
+      fakeDescriptor(() => new Promise<string>(() => {})),
+      fakeGenerator(() => new Promise<Buffer>(() => {})),
+      async (b) => b,
+    );
+    void crashed.tick();
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(
+      runs(f.repo, q.id).map((r) => r.status),
+      ['running'],
+    );
+    f.advance(300001);
+    const restarted = new Pipeline(
+      f.repo,
+      f.store,
+      fakeDescriptor(async () => 'A boat.'),
+      fakeGenerator(async () => Buffer.from('x')),
+      async (b) => b,
+    );
+    await restarted.tick();
+    assert.deepEqual(
+      runs(f.repo, q.id).map((r) => [r.attempt, r.status, r.error_kind, r.error]),
+      [
+        [1, 'failed', 'temporary', 'interrupted'],
+        [2, 'succeeded', null, null],
+      ],
+    );
+    assert.equal(runs(f.repo, q.id)[0].finished_at, f.repo.now());
+    // An interrupted final attempt is finalised when claim() fails the question.
+    const g = f.repo.get<Question>('questions', q.id)!;
+    g.attempts = 3;
+    f.repo.save('questions', g);
+    void crashed.tick();
+    await new Promise((r) => setImmediate(r));
+    f.advance(300001);
+    assert.equal(restarted.claim(), undefined);
+    assert.equal(f.repo.get<Question>('questions', q.id)!.state, 'failed');
+    assert.ok(analytics(f.repo, q.id).failed_at);
+    assert.deepEqual(
+      runs(f.repo, q.id).map((r) => [r.step, r.attempt, r.status, r.error]),
+      [
+        ['describe', 1, 'failed', 'interrupted'],
+        ['describe', 2, 'succeeded', null],
+        ['generate', 4, 'failed', 'interrupted'],
+      ],
+    );
+  } finally {
+    f.close();
+  }
+});
