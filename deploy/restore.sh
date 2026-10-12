@@ -53,7 +53,18 @@ if [[ $target != "$DATA_DIR" ]]; then
 fi
 
 [[ -f $MARKER ]] || die "$DATA_DIR is not the provisioned volume (no marker). Run deploy/setup.sh first."
-systemctl stop slop-or-not 2>/dev/null || true
+# Never move the database while the app might still be writing it.
+if systemctl cat slop-or-not.service >/dev/null 2>&1; then
+  systemctl stop slop-or-not || die 'could not stop slop-or-not; database left untouched.'
+  state=$(systemctl is-active slop-or-not || true)
+  [[ $state == inactive || $state == failed ]] ||
+    die "slop-or-not is still '$state' after stop; database left untouched."
+else
+  log 'slop-or-not.service not installed (first-time recovery); nothing to stop.'
+fi
+if pgrep -u "$APP_USER" -f 'src/main.ts' >/dev/null; then
+  die "an app process is still running as $APP_USER; database left untouched."
+fi
 if compgen -G "$DB*" >/dev/null; then
   aside="$DATA_DIR/pre-restore-$(date -u +%Y%m%dT%H%M%SZ)"
   mkdir -p "$aside"
