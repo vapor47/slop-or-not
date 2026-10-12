@@ -68,6 +68,49 @@ function login() {
     }
   };
 }
+const amount = (id, value) =>
+  id === 'stored_bytes'
+    ? `${(value / 1e9).toFixed(value < 1e8 ? 3 : 2)} GB`
+    : Number(value).toLocaleString();
+// Free-tier counters against their caps (80% of each free allowance) plus the kill switches.
+function meter(usage) {
+  return (
+    `<section class="panel meter" id="meter"><h2>Free-tier usage</h2>` +
+    usage.counters
+      .map((c) => {
+        const ratio = c.cap ? Math.min(1, c.used / c.cap) : 1;
+        return (
+          `<div class="meter-row${ratio >= 0.9 ? ' near' : ''}"><div class="meter-label">` +
+          `<span>${esc(c.label)}</span><span>${amount(c.id, c.used)} / ${amount(c.id, c.cap)}</span></div>` +
+          `<div class="progress"><span style="width:${(ratio * 100).toFixed(1)}%"></span></div></div>`
+        );
+      })
+      .join('') +
+    usage.warnings.map((w) => `<p class="muted loading-note">⚠ ${esc(w)}</p>`).join('') +
+    (usage.generationBlocked ? `<p class="error">${esc(usage.generationBlocked)}</p>` : '') +
+    `<label class="switch"><input type="checkbox" data-switch="generationDisabled"${usage.switches.generationDisabled ? ' checked' : ''}> Pause generation</label>` +
+    `<label class="switch"><input type="checkbox" data-switch="storageReadOnly"${usage.switches.storageReadOnly ? ' checked' : ''}> Storage read-only</label>` +
+    `</section>`
+  );
+}
+function bindMeter() {
+  document.querySelectorAll('[data-switch]').forEach(
+    (el) =>
+      (el.onchange = async () => {
+        el.disabled = true;
+        try {
+          const usage = await post('/api/owner/switches', { [el.dataset.switch]: el.checked });
+          document.querySelector('#meter').outerHTML = meter(usage);
+        } catch (e) {
+          el.checked = !el.checked;
+          notice(e.message);
+        } finally {
+          el.disabled = false;
+        }
+        bindMeter();
+      }),
+  );
+}
 async function studio() {
   clearInterval(polling);
   currentGame = null;
@@ -94,7 +137,9 @@ async function studio() {
             `</a>`,
         )
         .join('') || '<p class="muted">Your first game starts here.</p>') +
-      `</div>`;
+      `</div>` +
+      meter(data.usage);
+    bindMeter();
     document.querySelector('#logout').onclick = async () => {
       await post('/api/logout');
       login();

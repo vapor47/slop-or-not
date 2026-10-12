@@ -474,3 +474,33 @@ input {
     transition: none !important;
   }
 }
+.meter {
+  margin-top: 30px;
+}
+.meter h2 {
+  font-size: 22px;
+  letter-spacing: -0.5px;
+}
+.meter .progress {
+  margin: 6px 0 16px;
+}
+.meter-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+}
+.meter-row.near .progress span {
+  background: #b5452f;
+}
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: 20px;
+  font-size: 14px;
+}
+.switch input {
+  width: auto;
+  margin: 0;
+}
