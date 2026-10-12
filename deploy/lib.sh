@@ -6,6 +6,9 @@ DATA_DIR=${DATA_DIR:-/data}
 DB=$DATA_DIR/game.sqlite
 MARKER=$DATA_DIR/.slop-or-not-volume
 NODE=${NODE:-/usr/local/bin/node}
+# setup.sh installs node/npm in /usr/local/bin, which sudo's secure_path omits on
+# Oracle Linux; npm's '#!/usr/bin/env node' shebang also needs node on PATH.
+export PATH="${NODE%/*}:$PATH"
 
 log() { printf '[%s] %s\n' "${0##*/}" "$*"; }
 die() {

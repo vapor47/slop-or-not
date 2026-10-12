@@ -28,6 +28,10 @@ DATA_DEVICE_WAIT=${DATA_DEVICE_WAIT:-0}
 NODE_MAJOR=${NODE_MAJOR:-24}
 INSTALL_CLOUDFLARED=${INSTALL_CLOUDFLARED:-true}
 
+# Node is installed to /usr/local/bin, which sudo's secure_path omits on Oracle
+# Linux; without this, re-runs never see it and reinstall Node every time.
+export PATH="/usr/local/bin:$PATH"
+
 log() { printf '[setup] %s\n' "$*"; }
 warn() { printf '[setup] WARNING: %s\n' "$*" >&2; }
 die() {
