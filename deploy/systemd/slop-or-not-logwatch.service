@@ -1,0 +1,15 @@
+[Unit]
+Description=Alert on recurring Slop or Not failure events in the journal
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=slop
+Group=slop
+# Reading another unit's journal entries needs the systemd-journal group.
+SupplementaryGroups=systemd-journal
+ExecStart=/opt/slop-or-not/app/deploy/logwatch.sh
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes

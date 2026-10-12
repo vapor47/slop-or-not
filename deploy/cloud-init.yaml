@@ -1,0 +1,25 @@
+#cloud-config
+# Paste into "Show advanced options -> Management -> Initialization script" when
+# creating the VM (Ubuntu 24.04 or Oracle Linux 9, VM.Standard.A1.Flex).
+#
+# NO SECRETS HERE: user-data is readable by any process on the VM through the
+# instance metadata service and is shown in the OCI console. Copy
+# /etc/slop-or-not/app.env and tunnel.env over SSH after the VM boots.
+#
+# setup.sh waits up to 15 minutes for the block volume to be attached at
+# /dev/oracleoci/oraclevdb; attach it (paravirtualized) right after launch.
+# Progress: sudo tail -f /var/log/slop-or-not-setup.log
+runcmd:
+  - - bash
+    - -c
+    - |
+      set -euo pipefail
+      exec >>/var/log/slop-or-not-setup.log 2>&1
+      if ! command -v git >/dev/null; then
+        if command -v apt-get >/dev/null; then apt-get update -q && apt-get install -y -q git
+        else dnf install -y -q git; fi
+      fi
+      [ -d /opt/slop-or-not/app/.git ] ||
+        git clone https://github.com/vapor47/slop-or-not.git /opt/slop-or-not/app
+      DATA_DEVICE_WAIT=900 /opt/slop-or-not/app/deploy/setup.sh
+      echo "slop-or-not setup finished at $(date -u)"

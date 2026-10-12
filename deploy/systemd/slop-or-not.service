@@ -1,0 +1,47 @@
+[Unit]
+Description=Slop or Not (Node.js app + background job/cleanup loops)
+Documentation=https://github.com/vapor47/slop-or-not/blob/main/docs/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+# Never give up restarting: the job poller and minute-level cleanup must stay alive.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=slop
+Group=slop
+WorkingDirectory=/opt/slop-or-not/app
+EnvironmentFile=/etc/slop-or-not/app.env
+# Written by deploy.sh (GIT_SHA=...). git cannot read the root-owned checkout as this user.
+EnvironmentFile=-/etc/slop-or-not/version.env
+# Refuse to start on an unmounted /data: the app would create a fresh, empty database.
+ExecStartPre=/usr/bin/test -f /data/.slop-or-not-volume
+# Set at exec time: EnvironmentFile= values override Environment=, but not these, so
+# production checks (HTTPS origin, owner password) and the /data location can't be edited away.
+ExecStart=/usr/bin/env NODE_ENV=production DATA_DIR=/data /usr/local/bin/node src/main.ts
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+# stdout/stderr (including structured {"event":...} failure lines) go to journald.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=slop-or-not
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/data
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+# Do not set MemoryDenyWriteExecute: V8's JIT needs writable+executable memory.
+
+[Install]
+WantedBy=multi-user.target
