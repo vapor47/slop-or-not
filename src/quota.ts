@@ -40,6 +40,8 @@ const STALE = 15 * 60000;
 // Analytics ingestion delay: local calls this long before a reconciliation started may be
 // missing from Cloudflare's figure, so they are added on top (double counting is safe).
 const ANALYTICS_LAG = 10 * 60000;
+// Object puts abort after 120 s (src/storage.ts); a marker older than this cannot be live.
+export const STALE_PUT = 10 * 60000;
 export type Metric = 'neurons' | 'r2_class_a' | 'r2_class_b' | 'r2_free';
 export class QuotaError extends HttpError {}
 export type Reconciliation = {
@@ -69,9 +71,13 @@ export class Quota {
       CREATE TABLE IF NOT EXISTS neuron_calls(at INTEGER NOT NULL, day TEXT NOT NULL,
         units INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS neuron_calls_day ON neuron_calls(day, at);`);
-    // Only the app process writes objects; puts in flight before a restart are over. Their
-    // (larger) reservations stay until a later confirmed put or delete.
-    this.db.exec('UPDATE stored_objects SET pending=0 WHERE pending>0');
+    // Other connections (a second app instance, npm run sample) may open this database while a
+    // put is in flight, so only markers older than any possible put are cleared: those belong to
+    // a writer that crashed or restarted. Their (larger) reservations stay until a later
+    // confirmed put or delete.
+    this.db
+      .prepare('UPDATE stored_objects SET pending=0 WHERE pending>0 AND stored_at<?')
+      .run(this.now() - STALE_PUT);
   }
   // Joins an enclosing transaction (acceptUpload, retry, claim) or opens its own.
   atomic<T>(fn: () => T): T {

@@ -8,7 +8,7 @@ import { app } from '../src/server.ts';
 import { Pipeline } from '../src/pipeline.ts';
 import { CloudflareUsage } from '../src/cloudflare.ts';
 import { MeteredStore, ImageCache } from '../src/metered.ts';
-import { DEFAULT_LIMITS, IMAGES_UNAVAILABLE, limitsFromEnv } from '../src/quota.ts';
+import { DEFAULT_LIMITS, IMAGES_UNAVAILABLE, STALE_PUT, limitsFromEnv } from '../src/quota.ts';
 import { RATE_LIMITS } from '../src/ratelimit.ts';
 import type { Question } from '../src/types.ts';
 import { fixture, ready, fakeDescriptor, fakeGenerator, client } from './helpers.ts';
@@ -638,6 +638,52 @@ test('a queued job with less than one call of headroom does not call the model',
     assert.equal(await pipe.tick(), true);
     assert.equal(calls, 1);
     assert.equal(f.repo.quota.spentToday(), 200);
+  } finally {
+    f.close();
+  }
+});
+test('opening a second connection keeps live put markers and clears only stale ones', async () => {
+  const f = fixture();
+  try {
+    const gates: (() => void)[] = [];
+    const store = new MeteredStore(
+      {
+        put: async (k, b) => {
+          await new Promise<void>((r) => gates.push(r));
+          await f.store.put(k, b);
+        },
+        get: async (k) => f.store.get(k),
+        delete: async (k) => f.store.delete(k),
+      },
+      f.repo.quota,
+      new ImageCache(0),
+    );
+    const pendingOf = (key: string) =>
+      Number(f.repo.db.prepare('SELECT pending FROM stored_objects WHERE key=?').get(key)!.pending);
+    const late = store.put('k', Buffer.alloc(20));
+    assert.equal(pendingOf('k'), 1);
+    // e.g. npm run sample opening the same database while the app's put is in flight.
+    const other = new Repository(join(f.dir, 'test.sqlite'), 10000, f.repo.now);
+    try {
+      assert.equal(other.quota.storedBytes(), 20);
+      assert.equal(pendingOf('k'), 1);
+      // The delete-race protection still holds: a delete during the put keeps the record.
+      await store.delete('k');
+      assert.equal(f.repo.quota.storedBytes(), 20);
+      gates.splice(0).forEach((open) => open());
+      await late;
+      assert.equal(pendingOf('k'), 0);
+      // A marker left by a crashed writer is cleared once it is older than any possible put.
+      f.repo.db.prepare('UPDATE stored_objects SET pending=1 WHERE key=?').run('k');
+      f.advance(STALE_PUT - 1);
+      new Repository(join(f.dir, 'test.sqlite'), 10000, f.repo.now).db.close();
+      assert.equal(pendingOf('k'), 1);
+      f.advance(2);
+      new Repository(join(f.dir, 'test.sqlite'), 10000, f.repo.now).db.close();
+      assert.equal(pendingOf('k'), 0);
+    } finally {
+      other.db.close();
+    }
   } finally {
     f.close();
   }
