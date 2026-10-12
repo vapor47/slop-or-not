@@ -392,12 +392,22 @@ test('existing databases migrate additively and resume queued questions', async 
     };
   legacy.prepare('INSERT INTO games VALUES(?,?)').run('g1', JSON.stringify(game));
   legacy.prepare('INSERT INTO questions VALUES(?,?,?)').run('q1', 'g1', JSON.stringify(question));
+  const described = {
+    ...question,
+    id: 'q2',
+    original: 'orig2',
+    generated: 'gen2',
+    state: 'generate',
+    description: 'Already described.',
+  };
+  legacy.prepare('INSERT INTO questions VALUES(?,?,?)').run('q2', 'g1', JSON.stringify(described));
   legacy.prepare('INSERT INTO budget VALUES(?,?)').run('2026-10-12', 1040);
   legacy.close();
   const repo = new Repository(path, 10000, () => now);
   try {
     assert.equal(repo.budget().reserved, 1040);
     await f.store.put('orig', Buffer.from('original'));
+    await f.store.put('orig2', Buffer.from('original two'));
     const pipe = new Pipeline(
       repo,
       f.store,
@@ -405,8 +415,7 @@ test('existing databases migrate additively and resume queued questions', async 
       fakeGenerator(async () => Buffer.from('generated'), 'new-generator'),
       async (b) => b,
     );
-    await pipe.tick();
-    await pipe.tick();
+    for (let i = 0; i < 3; i++) await pipe.tick();
     const done = repo.get<Question>('questions', 'q1')!;
     assert.equal(done.state, 'ready');
     assert.equal(done.descriptorTemplate, repo.activeTemplate('describe').id);
@@ -415,6 +424,13 @@ test('existing databases migrate additively and resume queued questions', async 
       ['old-descriptor', 'old-generator'],
     );
     assert.equal(analytics(repo, 'q1').generate_template_id, repo.activeTemplate('generate').id);
+    // A question already past describe still gets its original measured before generation.
+    assert.equal(repo.get<Question>('questions', 'q2')!.state, 'ready');
+    assert.equal(repo.metrics('q2', 'original')!.bytes, 12);
+    assert.deepEqual(
+      runs(repo, 'q2').map((r) => [r.step, r.prompt_text]),
+      [['generate', 'A natural, realistic photograph. Already described.']],
+    );
     assert.equal(repo.budget().reserved, 1040);
   } finally {
     repo.db.close();

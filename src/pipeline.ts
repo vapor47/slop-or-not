@@ -137,6 +137,12 @@ export class Pipeline {
       } else {
         // The generator receives only saved text; never original bytes or an image URL.
         q.generatorModel ??= this.generator.model;
+        // Questions described before metrics were captured: best effort, never fails the step.
+        if (!this.repo.metrics(q.id, 'original'))
+          await this.store.get(q.original).then(
+            (original) => this.measure(q, 'original', original, null),
+            () => {},
+          );
         const template = this.repo.template(q.generatorTemplate!),
           prompt = template.text + q.description!;
         run = this.repo.startRun(q, {

@@ -194,19 +194,29 @@ export class Repository {
     hash: { sha256: string; bytes: number },
     metrics: ImageMetrics | null,
   ) {
+    const keys = [
+      'width',
+      'height',
+      'dhash',
+      'brightness',
+      'contrast',
+      'sharpness',
+      'colorfulness',
+    ] as const;
     const values: Value[] = [
       q.id,
       role,
       run,
       hash.sha256,
       hash.bytes,
-      ...(
-        ['width', 'height', 'dhash', 'brightness', 'contrast', 'sharpness', 'colorfulness'] as const
-      ).map((k) => metrics?.[k] ?? null),
+      ...keys.map((k) => metrics?.[k] ?? null),
       this.now(),
     ];
     this.db
-      .prepare(`INSERT OR REPLACE INTO image_metrics VALUES(${values.map(() => '?').join(',')})`)
+      .prepare(
+        `INSERT OR REPLACE INTO image_metrics(question_id,role,run_id,sha256,bytes,${keys.join(',')},measured_at)
+        VALUES(${values.map(() => '?').join(',')})`,
+      )
       .run(...values);
   }
   metrics(id: string, role: 'original' | 'generated') {
