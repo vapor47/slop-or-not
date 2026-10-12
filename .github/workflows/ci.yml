@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# Supersede in-flight runs for the same PR; runs on main always complete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -26,5 +31,7 @@ jobs:
 
       - name: Check sharp loads
         run: node --input-type=module -e "import sharp from 'sharp'; console.log('sharp', sharp.versions)"
+
+      - run: npm run format:check
 
       - run: npm run verify
