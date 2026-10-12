@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      # package-lock.json pins sharp's prebuilt @img/sharp-linux-x64 binaries;
+      # npm ci installs them as optional dependencies, so keep optional deps enabled.
+      - run: npm ci
+
+      - name: Check sharp loads
+        run: node --input-type=module -e "import sharp from 'sharp'; console.log('sharp', sharp.versions)"
+
+      - run: npm run verify
