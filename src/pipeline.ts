@@ -129,6 +129,7 @@ export class Pipeline {
         const original = await this.store.get(q.original),
           template = this.repo.template(q.descriptorTemplate!);
         if (!this.repo.metrics(q.id, 'original')) await this.measure(q, 'original', original, null);
+        this.repo.quota.spend(q.descriptorUnits ?? 200);
         run = this.repo.startRun(q, {
           step,
           provider: this.descriptor.provider,
@@ -160,6 +161,7 @@ export class Pipeline {
           );
         const template = this.repo.template(q.generatorTemplate!),
           prompt = template.text + q.description!;
+        this.repo.quota.spend(q.generatorUnits ?? 60);
         run = this.repo.startRun(q, {
           step,
           provider: this.generator.provider,

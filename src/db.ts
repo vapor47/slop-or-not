@@ -513,6 +513,7 @@ export class Repository {
       this.db.prepare('DELETE FROM sessions WHERE expires<?').run(this.now());
       this.db.prepare('DELETE FROM login_limits WHERE expires<?').run(this.now());
       this.db.prepare('DELETE FROM rate_limits WHERE expires<?').run(this.now());
+      this.db.prepare('DELETE FROM neuron_calls WHERE at<?').run(this.now() - 2 * 86400000);
     });
   }
 }

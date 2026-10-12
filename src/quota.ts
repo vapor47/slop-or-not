@@ -37,6 +37,9 @@ export const IMAGES_UNAVAILABLE = 'Images are temporarily unavailable. Please tr
 export const NEURONS_EXHAUSTED = 'Generation budget exhausted. Try again after midnight UTC.';
 // Reconciled usage older than this is reported as stale.
 const STALE = 15 * 60000;
+// Analytics ingestion delay: local calls this long before a reconciliation started may be
+// missing from Cloudflare's figure, so they are added on top (double counting is safe).
+const ANALYTICS_LAG = 10 * 60000;
 export type Metric = 'neurons' | 'r2_class_a' | 'r2_class_b' | 'r2_free';
 export class QuotaError extends HttpError {}
 export type Reconciliation = {
@@ -44,6 +47,8 @@ export type Reconciliation = {
   neurons: number | null;
   checkedAt: number;
   succeededAt: number | null;
+  // When the successful query started; local calls since (asOf − lag) are added on top.
+  asOf: number | null;
   error: boolean;
 };
 export class Quota {
@@ -60,7 +65,10 @@ export class Quota {
         used INTEGER NOT NULL, PRIMARY KEY(metric, period));
       CREATE TABLE IF NOT EXISTS stored_objects(key TEXT PRIMARY KEY, bytes INTEGER NOT NULL,
         stored_at INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS neuron_calls(at INTEGER NOT NULL, day TEXT NOT NULL,
+        units INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS neuron_calls_day ON neuron_calls(day, at);`);
   }
   // Joins an enclosing transaction (acceptUpload, retry, claim) or opens its own.
   atomic<T>(fn: () => T): T {
@@ -108,8 +116,9 @@ export class Quota {
   reserve(metric: Metric, amount: number, message: string, status = 503) {
     const period = this.period(metric);
     if (metric === 'neurons') {
-      const actual = this.actualNeurons();
-      if (actual !== null && actual + amount > this.limits.neurons)
+      // Account-wide usage plus every local reservation not yet spent must leave room.
+      const account = this.accountNeurons();
+      if (account !== null && account + this.outstanding() + amount > this.limits.neurons)
         throw new QuotaError(429, NEURONS_EXHAUSTED);
     }
     this.db.prepare('INSERT OR IGNORE INTO quota_usage VALUES(?,?,0)').run(metric, period);
@@ -172,7 +181,38 @@ export class Quota {
     const r = this.reconciliation();
     return r && r.day === this.day() ? r.neurons : null;
   }
-  recordReconciliation(day: string, neurons: number | null) {
+  // Conservative account-wide usage: Cloudflare's last figure plus local calls since it was taken.
+  accountNeurons() {
+    const r = this.reconciliation();
+    if (!r || r.day !== this.day() || r.neurons === null) return null;
+    const row = this.db
+      .prepare('SELECT COALESCE(SUM(units),0) AS n FROM neuron_calls WHERE day=? AND at>=?')
+      .get(r.day, (r.asOf ?? r.checkedAt) - ANALYTICS_LAG);
+    return r.neurons + Number(row?.n || 0);
+  }
+  spentToday() {
+    const row = this.db
+      .prepare('SELECT COALESCE(SUM(units),0) AS n FROM neuron_calls WHERE day=?')
+      .get(this.day());
+    return Number(row?.n || 0);
+  }
+  // Today's reservations not yet consumed by a model call.
+  outstanding() {
+    return Math.max(0, this.used('neurons') - this.spentToday());
+  }
+  // Checked and recorded immediately before every model call, including calls for questions
+  // reserved earlier, so queued work cannot start without headroom for that call.
+  spend(units: number) {
+    this.atomic(() => {
+      if (this.setting('generation_disabled'))
+        throw new QuotaError(503, 'Generation is paused by the owner.');
+      const account = this.accountNeurons();
+      if (account !== null && account + units > this.limits.neurons)
+        throw new QuotaError(429, NEURONS_EXHAUSTED);
+      this.db.prepare('INSERT INTO neuron_calls VALUES(?,?,?)').run(this.now(), this.day(), units);
+    });
+  }
+  recordReconciliation(day: string, neurons: number | null, asOf = this.now()) {
     const previous = this.reconciliation();
     const value: Reconciliation =
       neurons === null
@@ -182,19 +222,21 @@ export class Quota {
             neurons: previous?.day === day ? previous.neurons : null,
             checkedAt: this.now(),
             succeededAt: previous?.succeededAt ?? null,
+            asOf: previous?.day === day ? (previous.asOf ?? null) : null,
             error: true,
           }
-        : { day, neurons, checkedAt: this.now(), succeededAt: this.now(), error: false };
+        : { day, neurons, checkedAt: this.now(), succeededAt: this.now(), asOf, error: false };
     this.db
       .prepare("INSERT OR REPLACE INTO settings VALUES('neuron_reconciliation',?)")
       .run(JSON.stringify(value));
   }
   async reconcile(source: { neuronsUsed(start: Date, end: Date): Promise<number> }) {
     const day = this.day(),
+      asOf = this.now(),
       start = new Date(`${day}T00:00:00Z`);
     try {
       const neurons = await source.neuronsUsed(start, new Date(start.getTime() + 86400000));
-      this.recordReconciliation(day, Math.ceil(neurons));
+      this.recordReconciliation(day, Math.ceil(neurons), asOf);
       return true;
     } catch {
       this.recordReconciliation(day, null);
@@ -212,8 +254,8 @@ export class Quota {
   // Reason new AI calls must not start, or null.
   generationBlocked() {
     if (this.setting('generation_disabled')) return 'Generation is paused by the owner.';
-    const actual = this.actualNeurons();
-    if (actual !== null && actual >= this.limits.neurons)
+    const account = this.accountNeurons();
+    if (account !== null && account >= this.limits.neurons)
       return 'The daily AI allowance has been reached. Generation resumes after midnight UTC.';
     return null;
   }
@@ -294,11 +336,11 @@ export class Quota {
       },
     ];
     const r = this.reconciliation(),
-      actual = this.actualNeurons();
+      actual = this.accountNeurons();
     if (actual !== null)
       counters.splice(1, 0, {
         id: 'neurons_actual',
-        label: 'Workers AI neurons used today (Cloudflare, account-wide)',
+        label: 'Workers AI neurons used today (Cloudflare account-wide + recent local calls)',
         used: actual,
         cap: this.limits.neurons,
         allowance: ALLOWANCES.neurons,

@@ -519,3 +519,72 @@ test('legacy objects are backfilled into the stored-bytes ledger on open', () =>
     f.close();
   }
 });
+test('reservations between polls count pending local spend against reconciled usage', async () => {
+  const f = fixture(8000);
+  try {
+    const q = f.repo.quota;
+    // Other consumers on the account used 7000; locally nothing is reserved yet.
+    await q.reconcile(usage(7000));
+    f.repo.reserve(280);
+    f.repo.reserve(280);
+    f.repo.reserve(280);
+    // 7000 + 840 outstanding + 280 > 8000, although each call alone would fit.
+    assert.throws(() => f.repo.reserve(280), /budget exhausted/);
+    // Spending a reservation moves it from outstanding into the account estimate.
+    q.spend(280);
+    assert.equal(q.accountNeurons(), 7280);
+    assert.equal(q.outstanding(), 560);
+    assert.throws(() => f.repo.reserve(280), /budget exhausted/);
+    // Calls made long before the last poll are already in Cloudflare's figure.
+    f.advance(20 * 60000);
+    await q.reconcile(usage(7280));
+    assert.equal(q.accountNeurons(), 7280);
+    q.spend(100);
+    assert.equal(q.accountNeurons(), 7380);
+    q.spend(620);
+    assert.equal(q.accountNeurons(), 8000);
+    assert.match(String(q.generationBlocked()), /daily AI allowance/);
+    assert.throws(() => q.spend(1), /budget exhausted/);
+  } finally {
+    f.close();
+  }
+});
+test('a queued job with less than one call of headroom does not call the model', async () => {
+  const f = fixture(8000);
+  try {
+    const g = f.repo.create('Queued'),
+      q = f.repo.acceptUpload(g.id);
+    q.state = 'describe';
+    f.repo.save('questions', q);
+    await f.store.put(q.original, Buffer.from('x'));
+    let calls = 0;
+    const pipe = new Pipeline(
+      f.repo,
+      f.store,
+      fakeDescriptor(async () => {
+        calls++;
+        return 'x';
+      }),
+      fakeGenerator(async () => Buffer.from('y')),
+      async (b) => b,
+    );
+    // Reserved earlier today; the account then reached 7990 of 8000 elsewhere.
+    await f.repo.quota.reconcile(usage(7990));
+    assert.equal(f.repo.quota.generationBlocked(), null);
+    assert.equal(await pipe.tick(), true);
+    assert.equal(calls, 0);
+    const after = f.repo.get<Question>('questions', q.id)!;
+    assert.equal(after.state, 'describe');
+    assert.equal(after.attempts, 0);
+    assert.match(after.error!, /budget exhausted/);
+    assert.equal(f.repo.quota.spentToday(), 0);
+    assert.equal(f.repo.db.prepare('SELECT COUNT(*) AS n FROM generation_runs').get()!.n, 0);
+    // With headroom again (next day), the job runs and its call is recorded.
+    f.advance(86400000);
+    assert.equal(await pipe.tick(), true);
+    assert.equal(calls, 1);
+    assert.equal(f.repo.quota.spentToday(), 200);
+  } finally {
+    f.close();
+  }
+});

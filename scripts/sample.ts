@@ -29,18 +29,19 @@ const limits = limitsFromEnv(process.env),
     undefined,
     limits,
   ),
-  units =
-    Number(process.env.DESCRIPTOR_NEURON_RESERVATION || 200) +
-    Number(process.env.GENERATOR_NEURON_RESERVATION || 80);
+  descriptorUnits = Number(process.env.DESCRIPTOR_NEURON_RESERVATION || 200),
+  generatorUnits = Number(process.env.GENERATOR_NEURON_RESERVATION || 80);
 await mkdir('data/sample', { recursive: true });
 for (const [i, path] of paths.entries()) {
   const blocked = repo.quota.generationBlocked();
   if (blocked) throw new Error(blocked);
-  repo.reserve(units);
+  repo.reserve(descriptorUnits + generatorUnits);
   const original = await normalize(await readFile(path), true),
     start = Date.now();
+  repo.quota.spend(descriptorUnits);
   const description = (await descriptor.describe(original, DEFAULT_TEMPLATES.describe.text)).text,
     described = Date.now();
+  repo.quota.spend(generatorUnits);
   const generated = await normalize(
     (await generator.generate(DEFAULT_TEMPLATES.generate.text + description.slice(0, 1900))).image,
   );
