@@ -49,11 +49,52 @@ A successful description is persisted before generation is queued. Temporary err
 
 ## Budget enforcement
 
-SQLite `BEGIN IMMEDIATE` transactions reserve capacity before upload bodies are accepted. Each question reserves four calls per step, initially **1,040 units**: four times `(200 descriptor + 60 generator)`. These conservative per-call estimates are configurable independently with `DESCRIPTOR_NEURON_RESERVATION` and `GENERATOR_NEURON_RESERVATION`. The default app daily budget is **9,000 units**, leaving headroom under Cloudflare’s 10,000-neuron allowance. Reservations permit eight new questions per day with default settings; a ten-question game can be assembled across days. Unused successful-generation reservations are intentionally retained for the day rather than optimistic refunds. Invalid/interrupted uploads refund unused reservations.
+SQLite `BEGIN IMMEDIATE` transactions reserve capacity before upload bodies are accepted. Each question reserves four calls per step: four times `(200 descriptor + 80 generator)` = **1,120 neurons** with the default settings. These conservative per-call estimates are configurable independently with `DESCRIPTOR_NEURON_RESERVATION` and `GENERATOR_NEURON_RESERVATION`. The generator default is 80 because Cloudflare prices flux-1-schnell at 4.80 neurons per 512×512 tile plus 9.60 per step, which comes to about 57.6 neurons at 1024² and four steps. The default daily budget is **8,000 neurons** (80% of the 10,000 free allowance). That allows seven new questions per day; a ten-question game can be assembled across days. Unused reservations from successful generations are kept for the day rather than refunded optimistically. Invalid or interrupted uploads refund their unused reservations.
 
-Retries reserve another bounded cycle; queued work crossing midnight UTC must reserve capacity for the new day before making calls. The app cannot observe other applications consuming the same Cloudflare account allowance, nor enforce actual provider charges from estimates. Use a Workers Free account, verify actual neuron usage on the sample, and set the application budget below the account allowance after accounting for any other uses. Changing models or parameters requires revalidating the per-call estimates. Requests fail gracefully if Cloudflare returns exhausted capacity.
+Retries reserve another bounded cycle. Queued work that crosses midnight UTC must reserve capacity for the new day before it makes calls. Changing models or parameters requires revalidating the per-call estimates.
 
-[Cloudflare pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)
+## Staying at $0
+
+Hard rule: this project must never cost money. Every paid surface fails **closed** before reaching **80%** of its free allowance. All counters live in SQLite (`quota_usage`, `stored_objects`, `settings`), so they survive restarts. Each call is reserved through one gate (`src/quota.ts`) *before* the provider is called.
+
+### Caps
+
+| Surface | Free allowance | Default cap (80%) | Env var | Resets | Enforcement |
+|---|---|---|---|---|---|
+| Workers AI neurons | 10,000 / day | 8,000 / day | `DAILY_NEURON_BUDGET` | 00:00 UTC | Reserved per question before upload/retry/day rollover; optional reconciliation with actual account usage |
+| R2 Class A ops (PutObject…) | 1,000,000 / month | 800,000 | `R2_CLASS_A_MONTHLY_CAP` | `R2_BILLING_DAY` | Every put through `MeteredStore`; uploads refused at cap |
+| R2 Class B ops (GetObject…) | 10,000,000 / month | 8,000,000 | `R2_CLASS_B_MONTHLY_CAP` | `R2_BILLING_DAY` | Every uncached get; guests see "Images are temporarily unavailable" at cap |
+| R2 storage (Standard) | 10 GB-month | 8,000,000,000 bytes | `R2_STORED_BYTES_CAP` | — | Bytes tracked per object; uploads refused when projected bytes exceed the cap |
+| R2 DeleteObject | Free | not capped (counted) | — | — | Never refused: deletion is how storage shrinks |
+| R2 egress | Free | — | — | — | — |
+| Live games / questions | — | 50 / 500 | `MAX_LIVE_GAMES`, `MAX_LIVE_QUESTIONS` | — | Backstop on stored objects |
+
+Sources, checked **2026-10-12**:
+
+- [Workers AI pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/): 10,000 neurons/day on both Free and Paid, reset at 00:00 UTC. On Workers Free, "further operations will fail with an error" past the allocation.
+- [R2 pricing](https://developers.cloudflare.com/r2/pricing/): Standard storage is 10 GB-month, Class A 1M/month and Class B 10M/month, with free egress. DeleteObject is free. The free tier applies to Standard storage only.
+
+Caps can be lowered through env; values above 80% are rejected at startup. "GB" is read as 10⁹ bytes, the smaller reading. Cloudflare does not document whether R2's monthly allowance follows the calendar month or the billing cycle, so set `R2_BILLING_DAY` to the day your billing period starts. The stored-bytes cap is applied to current bytes, which bounds the GB-month average, since that average is computed from daily peaks.
+
+### How the gate behaves
+
+- **Neurons.** Reservations are made per question as described above. If `CLOUDFLARE_ANALYTICS_TOKEN` is set (a read-only API token with *Account Analytics: Read*), the app queries Cloudflare's GraphQL Analytics API (`aiInferenceAdaptiveGroups`, `sum.totalNeurons`) every five minutes for account-wide usage today. If that usage is at or above the cap, generation hard-stops for the rest of the UTC day. Even if later checks fail, the stop holds until the day rolls over. Without the token, the app relies on its local estimates; `/health` and the owner meter then show a warning. The app cannot see other applications on the same account unless reconciliation is configured. Cloudflare's reset timing has been reported to drift from 00:00 UTC ([cloudflare-docs#34137](https://github.com/cloudflare/cloudflare-docs/issues/34137)). That only affects availability: on Workers Free, over-use errors instead of billing.
+- **R2.** All object operations go through `MeteredStore`. Puts reserve one Class A op and the object's bytes first. A failed put keeps its reservation, because over-counting is safe. Gets reserve one Class B op unless the image is served from the in-memory LRU cache (`IMAGE_CACHE_MAX_BYTES`, default 64 MiB). Cache hits are not counted, because they never reach R2. Successful deletes release the object's bytes. Objects stored before this ledger existed are backfilled when the database opens, using measured sizes or a 2 MiB estimate.
+- **No wasted spend.** The worker does not claim jobs while generation is paused or stopped, or while storage is read-only or lacks headroom for another image. A quota refusal that happens before a model call does not use up one of the question's attempts.
+- **Images.** Each play image URL is unique to its playthrough and its content never changes. Play images are therefore sent with `Cache-Control: private, max-age` (up to one day, never past expiry) and without validators. Both images of a pair are loaded together, so response timing never reveals which side is AI. Errors stay `no-store`.
+- **Rate limits.** Requests are limited per minute, per IP and per playthrough or invite, on image, start, answer/next/view and invite endpoints (`src/ratelimit.ts`), using the same SQLite pattern as login limits. Behind a proxy or Cloudflare Tunnel, set `CLIENT_IP_HEADER=cf-connecting-ip`; otherwise every guest shares the proxy's address. Leave it unset when the app is exposed directly.
+- **Kill switches.** On the create page, the owner can pause generation or make storage read-only (`POST /api/owner/switches`). Both take effect immediately, without a redeploy. Read-only blocks writes only. Deletes continue because they are free, they shrink storage, and they enforce expiry.
+- **Meter and health.** `GET /api/owner/usage` returns each counter against its cap, and the create page shows them as bars. `/health` reports which counters are at ≥90% of their cap (`quota.nearLimit`), the reconciliation status (`ok`, `stale`, `failed` or `not_configured`), and the switch states. It never returns secrets or figures.
+
+### Checklist
+
+- [ ] Keep the Cloudflare account on **Workers Free**. On Workers Paid, neurons beyond 10,000/day are **billed** instead of refused. Never upgrade.
+- [ ] Enable Cloudflare **billing notifications** (Billing → Notifications) so any non-zero invoice or usage alert reaches you immediately.
+- [ ] Keep the R2 bucket on **Standard** storage with the **15-day lifecycle rule** on `slop/` (see above), and disable versioning or expire noncurrent versions.
+- [ ] Never add paid add-ons: Workers Paid, R2 Infrequent Access, Images, Stream, Logpush, Argo and so on.
+- [ ] Set `R2_BILLING_DAY` to your billing-period start day, and `CLOUDFLARE_ANALYTICS_TOKEN` to a read-only analytics token.
+- [ ] Keep Oracle Cloud on **Always Free**. Never upgrade to Pay-As-You-Go.
+- [ ] Check the owner meter and `/health` after release; investigate any `nearLimit` entry.
 
 ## Analytics and retention
 
@@ -82,7 +123,7 @@ This explicitly makes two live model calls per sample (one to each model, no ret
 npm run verify
 ```
 
-Tests cover prompt template seeding and immutable versioning, generation-run recording on success and temporary/permanent failure, image metrics, analytics surviving expiry, migration of an existing database, score correctness, repeated answer/Next requests, persistence across reopening SQLite, independent randomized playthroughs, publication freezing, question limits, budget reservations from two database connections, daily rollover, bounded step retries, crash leases, expiration and deletion, late image writes, model separation, upload-content validation and stripped metadata. Route integration uses the real request handler with in-process streams so it can run without opening a port. It uses injected fake storage/models and does not claim to verify Cloudflare or S3.
+Tests cover prompt template seeding and immutable versioning, generation-run recording on success and temporary/permanent failure, image metrics, analytics surviving expiry, migration of an existing database, score correctness, repeated answer/Next requests, persistence across reopening SQLite, independent randomized playthroughs, publication freezing, question limits, budget reservations from two database connections, daily rollover, free-tier caps failing closed (neurons, R2 Class A/B, stored bytes, live games/questions), quota counters persisting across reopening SQLite, UTC day and billing-month rollover, cache hits avoiding R2, rate limits, kill switches, neuron reconciliation stops, bounded step retries, crash leases, expiration and deletion, late image writes, model separation, upload-content validation and stripped metadata. Route integration uses the real request handler with in-process streams so it can run without opening a port. It uses injected fake storage/models and does not claim to verify Cloudflare or S3.
 
 Image tests require Sharp to be installed and do not skip security checks. TypeScript checks and all image tests must pass with dependencies installed. Browser verification should cover a mobile viewport, image failures and retry, refreshing during feedback, resuming later, double-clicking Next, replay, login failure and expired links.
 
@@ -92,7 +133,7 @@ The Dockerfile supports a Node host with a persistent volume. Set `NODE_ENV=prod
 
 Generation jobs are database-backed and survive restarts. The service polls work every second and runs expiration/deletion every minute. Keep the process running for scheduled deletion; startup also expires stale games. Durable deletion tombstones retry S3 failures and survive restarts. Public links stop working immediately at expiry even if object deletion is delayed.
 
-Structured server logs report processing, worker, request and cleanup failures without provider credentials or descriptions. Collect stderr in the hosting platform and alert on recurring failures; `/health` reports whether generation and storage are configured. This repository does not provision an external monitoring account.
+Structured server logs report processing, worker, request and cleanup failures without provider credentials or descriptions. Collect stderr in the hosting platform and alert on recurring failures; `/health` reports whether generation and storage are configured, plus free-tier quota status. This repository does not provision an external monitoring account.
 
 This app uses Node.js, Sharp and persistent SQLite, so the Cloudflare Workers runtime used by Sites is not a drop-in deployment target. A container or equivalent Node host is needed. Hosting, bucket creation and provider credentials have not been provisioned in this workspace.
 
