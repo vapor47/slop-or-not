@@ -1,5 +1,8 @@
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
-import { basename } from 'node:path';
+import { basename, resolve } from 'node:path';
+import { mkdirSync } from 'node:fs';
+import { Repository } from '../src/db.ts';
+import { limitsFromEnv } from '../src/quota.ts';
 import { CloudflareAPI, CloudflareDescriptor, CloudflareGenerator } from '../src/cloudflare.ts';
 import { normalize } from '../src/images.ts';
 import { DEFAULT_TEMPLATES } from '../src/prompts.ts';
@@ -15,8 +18,25 @@ if (!paths.length || paths.length > 5)
 const api = new CloudflareAPI(process.env.CLOUDFLARE_ACCOUNT_ID, process.env.CLOUDFLARE_API_TOKEN);
 const descriptor = new CloudflareDescriptor(api, process.env.DESCRIPTOR_MODEL),
   generator = new CloudflareGenerator(api, process.env.GENERATOR_MODEL);
+// Samples spend the same daily neuron allowance as the app, so they pass the same gate.
+const directory = resolve(process.env.DATA_DIR || 'data');
+mkdirSync(directory, { recursive: true });
+const limits = limitsFromEnv(process.env),
+  repo = new Repository(
+    resolve(directory, 'game.sqlite'),
+    limits.neurons,
+    Date.now,
+    undefined,
+    limits,
+  ),
+  units =
+    Number(process.env.DESCRIPTOR_NEURON_RESERVATION || 200) +
+    Number(process.env.GENERATOR_NEURON_RESERVATION || 80);
 await mkdir('data/sample', { recursive: true });
 for (const [i, path] of paths.entries()) {
+  const blocked = repo.quota.generationBlocked();
+  if (blocked) throw new Error(blocked);
+  repo.reserve(units);
   const original = await normalize(await readFile(path), true),
     start = Date.now();
   const description = (await descriptor.describe(original, DEFAULT_TEMPLATES.describe.text)).text,
@@ -47,3 +67,4 @@ for (const [i, path] of paths.entries()) {
     `Sample ${i + 1}: described in ${described - start} ms, generated in ${Date.now() - described} ms. Compare data/sample images; verify actual neuron usage in Cloudflare.`,
   );
 }
+repo.db.close();

@@ -86,6 +86,10 @@ Caps can be lowered through env; values above 80% are rejected at startup. "GB" 
 - **Kill switches.** On the create page, the owner can pause generation or make storage read-only (`POST /api/owner/switches`). Both take effect immediately, without a redeploy. Read-only blocks writes only. Deletes continue because they are free, they shrink storage, and they enforce expiry.
 - **Meter and health.** `GET /api/owner/usage` returns each counter against its cap, and the create page shows them as bars. `/health` reports which counters are at ≥90% of their cap (`quota.nearLimit`), the reconciliation status (`ok`, `stale`, `failed` or `not_configured`), and the switch states. It never returns secrets or figures.
 
+`npm run sample` reserves neurons through the same gate (using `DATA_DIR`) before each photo. `npm run storage:check` makes three unmetered R2 operations (one put, one get, one free delete); run it rarely. Future database backups to R2 must go through `MeteredStore` so their operations and bytes are counted.
+
+**Upgrading an existing `.env`:** `DAILY_NEURON_BUDGET` above 8000 now fails at startup. Lower it, raise `GENERATOR_NEURON_RESERVATION` to 80, and set `R2_BILLING_DAY`.
+
 ### Checklist
 
 - [ ] Keep the Cloudflare account on **Workers Free**. On Workers Paid, neurons beyond 10,000/day are **billed** instead of refused. Never upgrade.

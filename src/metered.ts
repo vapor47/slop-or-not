@@ -41,6 +41,8 @@ export class MeteredStore implements ImageStore {
   inner: ImageStore;
   quota: Quota;
   cache: ImageCache;
+  // Concurrent misses for the same key (both images of a pair are requested at once) share one read.
+  pending = new Map<string, Promise<Buffer>>();
   constructor(inner: ImageStore, quota: Quota, cache: ImageCache) {
     this.inner = inner;
     this.quota = quota;
@@ -54,10 +56,18 @@ export class MeteredStore implements ImageStore {
   async get(key: string) {
     const hit = this.cache.get(key);
     if (hit) return hit;
+    const pending = this.pending.get(key);
+    if (pending) return pending;
     this.quota.reserve('r2_class_b', 1, IMAGES_UNAVAILABLE);
-    const bytes = await this.inner.get(key);
-    this.cache.set(key, bytes);
-    return bytes;
+    const read = this.inner
+      .get(key)
+      .then((bytes) => {
+        this.cache.set(key, bytes);
+        return bytes;
+      })
+      .finally(() => this.pending.delete(key));
+    this.pending.set(key, read);
+    return read;
   }
   async delete(key: string) {
     this.cache.delete(key);

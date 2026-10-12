@@ -126,6 +126,12 @@ test('cache hits avoid R2 calls and op counts; the cache is bounded by bytes', a
     assert.equal(calls.get, 3);
     await store.delete('c');
     await assert.rejects(store.get('c'), /not found/);
+    // Concurrent misses for one key share a single R2 read.
+    store.cache.delete('a');
+    store.cache.delete('b');
+    const before = calls.get;
+    await Promise.all([store.get('a'), store.get('a'), store.get('b')]);
+    assert.equal(calls.get, before + 2);
   } finally {
     f.close();
   }
