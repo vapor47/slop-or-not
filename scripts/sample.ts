@@ -2,6 +2,7 @@ import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { CloudflareAPI, CloudflareDescriptor, CloudflareGenerator } from '../src/cloudflare.ts';
 import { normalize } from '../src/images.ts';
+import { DEFAULT_TEMPLATES } from '../src/prompts.ts';
 if (
   !process.env.CLOUDFLARE_ACCOUNT_ID ||
   !process.env.CLOUDFLARE_API_TOKEN ||
@@ -18,9 +19,11 @@ await mkdir('data/sample', { recursive: true });
 for (const [i, path] of paths.entries()) {
   const original = await normalize(await readFile(path), true),
     start = Date.now();
-  const description = await descriptor.describe(original),
+  const description = (await descriptor.describe(original, DEFAULT_TEMPLATES.describe.text)).text,
     described = Date.now();
-  const generated = await normalize(await generator.generate(description));
+  const generated = await normalize(
+    (await generator.generate(DEFAULT_TEMPLATES.generate.text + description.slice(0, 1900))).image,
+  );
   await writeFile(`data/sample/${i}-original.jpg`, original);
   await writeFile(`data/sample/${i}-generated.jpg`, generated);
   await writeFile(
@@ -30,7 +33,9 @@ for (const [i, path] of paths.entries()) {
         source: basename(path),
         description,
         descriptorModel: descriptor.model,
+        descriptorParams: descriptor.params,
         generatorModel: generator.model,
+        generatorParams: generator.params,
         descriptionMs: described - start,
         generationMs: Date.now() - described,
       },

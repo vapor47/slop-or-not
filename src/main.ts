@@ -6,7 +6,7 @@ import { app } from './server.ts';
 import { Pipeline } from './pipeline.ts';
 import { CloudflareAPI, CloudflareDescriptor, CloudflareGenerator } from './cloudflare.ts';
 import type { ImageStore } from './types.ts';
-import type { Normalizer } from './pipeline.ts';
+import type { Normalizer, Analyzer } from './pipeline.ts';
 const env = process.env,
   production = env.NODE_ENV === 'production';
 const origin = env.APP_ORIGIN || 'http://localhost:3000';
@@ -27,11 +27,12 @@ const repo = new Repository(resolve(directory, 'game.sqlite'), budget, Date.now,
 const auth = new Auth(repo, env.OWNER_PASSWORD_HASH || '', origin.startsWith('https://'));
 let store: ImageStore | null = null,
   normalize: Normalizer | null = null,
+  analyze: Analyzer | null = null,
   pipeline: Pipeline | null = null;
 if (env.S3_BUCKET) {
   const { S3Store } = await import('./storage.ts');
   store = new S3Store(env);
-  normalize = (await import('./images.ts')).normalize;
+  ({ normalize, analyze } = await import('./images.ts'));
 }
 if (
   store &&
@@ -47,6 +48,7 @@ if (
     new CloudflareDescriptor(api, env.DESCRIPTOR_MODEL),
     new CloudflareGenerator(api, env.GENERATOR_MODEL),
     normalize,
+    analyze,
   );
 }
 const server = app(repo, auth, store, pipeline, normalize, origin);

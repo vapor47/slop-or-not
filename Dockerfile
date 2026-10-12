@@ -4,7 +4,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY src ./src
 COPY public ./public
-ENV NODE_ENV=production HOST=0.0.0.0 DATA_DIR=/data
+ARG GIT_SHA=""
+ENV NODE_ENV=production HOST=0.0.0.0 DATA_DIR=/data GIT_SHA=$GIT_SHA
 VOLUME /data
 EXPOSE 3000
 CMD ["node", "src/main.ts"]

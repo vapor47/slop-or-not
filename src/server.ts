@@ -129,6 +129,7 @@ export function app(
                 repo.game(game.id, true);
                 q.state = 'describe';
                 repo.save('questions', q);
+                repo.track(q, { uploaded_at: repo.now() });
               });
               return json(res, { id: q.id }, 201);
             } catch (e) {
