@@ -9,6 +9,7 @@ import type {
 import { ProviderError } from './types.ts';
 import { Repository } from './db.ts';
 import { APP_VERSION } from './version.ts';
+import { QuotaError, IMAGE_ESTIMATE } from './quota.ts';
 export type Normalizer = (bytes: Buffer, upload?: boolean) => Promise<Buffer>;
 export type Analyzer = (bytes: Buffer) => Promise<ImageMetrics>;
 export function hamming(a: string, b: string) {
@@ -62,11 +63,16 @@ export class Pipeline {
   }
   claim(): Question | undefined {
     return this.repo.transaction(() => {
+      // Kill switch or reconciled daily allowance reached: leave every question untouched.
+      if (this.repo.quota.generationBlocked()) return;
+      // Never spend neurons on an image that could not be stored.
+      const storageBlocked = this.repo.quota.storageBlocked(IMAGE_ESTIMATE);
       for (const q of this.repo.list<Question>('questions')) {
         if (
           !['describe', 'generate'].includes(q.state) ||
           q.due > this.repo.now() ||
-          q.lease > this.repo.now()
+          q.lease > this.repo.now() ||
+          storageBlocked
         )
           continue;
         // Unleased and due: any run still marked running was interrupted by a crash or restart.
@@ -123,6 +129,7 @@ export class Pipeline {
         const original = await this.store.get(q.original),
           template = this.repo.template(q.descriptorTemplate!);
         if (!this.repo.metrics(q.id, 'original')) await this.measure(q, 'original', original, null);
+        this.repo.quota.spend(q.descriptorUnits ?? 200);
         run = this.repo.startRun(q, {
           step,
           provider: this.descriptor.provider,
@@ -154,6 +161,7 @@ export class Pipeline {
           );
         const template = this.repo.template(q.generatorTemplate!),
           prompt = template.text + q.description!;
+        this.repo.quota.spend(q.generatorUnits ?? 60);
         run = this.repo.startRun(q, {
           step,
           provider: this.generator.provider,
@@ -179,13 +187,20 @@ export class Pipeline {
       if (run !== null)
         this.repo.finishRun(run, { finished, status: 'succeeded', output, ...meta });
     } catch (error) {
-      const temporary =
-        error instanceof ProviderError ? error.temporary : error instanceof TypeError;
+      const refused = error instanceof QuotaError,
+        temporary =
+          refused ||
+          (error instanceof ProviderError ? error.temporary : error instanceof TypeError);
       q.error =
-        error instanceof ProviderError
+        error instanceof ProviderError || refused
           ? error.message
           : 'Image processing or storage failed. Retry this question.';
-      if (temporary && q.attempts < 4) q.due = this.repo.now() + 1000 * 2 ** q.attempts;
+      if (refused) {
+        // A quota refusal is not the question's fault. If no model was called yet it does not use
+        // up an attempt; otherwise the attempt counts, so neuron spend stays within the reservation.
+        if (run === null) q.attempts--;
+        q.due = this.repo.now() + 15 * 60000;
+      } else if (temporary && q.attempts < 4) q.due = this.repo.now() + 1000 * 2 ** q.attempts;
       else {
         q.state = 'failed';
         this.repo.track(q, { failed_at: this.repo.now() });
@@ -201,7 +216,7 @@ export class Pipeline {
         });
       console.error(
         JSON.stringify({
-          event: 'processing_failure',
+          event: refused ? 'quota_refusal' : 'processing_failure',
           question: q.id,
           step,
           attempt: q.attempts,

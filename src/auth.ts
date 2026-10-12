@@ -2,6 +2,7 @@ import { scryptSync, timingSafeEqual, createHash } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Repository, token } from './db.ts';
 import { HttpError } from './types.ts';
+import { clientIp } from './ratelimit.ts';
 export const hashToken = (value: string) => createHash('sha256').update(value).digest('hex');
 export function cookies(req: IncomingMessage) {
   return Object.fromEntries((req.headers.cookie || '').split(';').map((c) => c.trim().split('=')));
@@ -10,10 +11,12 @@ export class Auth {
   repo: Repository;
   passwordHash: string;
   secure: boolean;
-  constructor(repo: Repository, passwordHash: string, secure: boolean) {
+  ipHeader?: string;
+  constructor(repo: Repository, passwordHash: string, secure: boolean, ipHeader?: string) {
     this.repo = repo;
     this.passwordHash = passwordHash;
     this.secure = secure;
+    this.ipHeader = ipHeader;
   }
   owner(req: IncomingMessage) {
     const cookie = cookies(req).owner;
@@ -24,7 +27,7 @@ export class Auth {
       throw new HttpError(401, 'Sign in to create games.');
   }
   login(req: IncomingMessage, res: ServerResponse, password: string) {
-    const ip = req.socket.remoteAddress || 'unknown';
+    const ip = clientIp(req, this.ipHeader);
     const row = this.repo.db.prepare('SELECT count, expires FROM login_limits WHERE ip=?').get(ip);
     if (row && Number(row.expires) > this.repo.now() && Number(row.count) >= 10)
       throw new HttpError(429, 'Too many login attempts. Try again in 15 minutes.');

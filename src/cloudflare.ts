@@ -77,3 +77,51 @@ export class CloudflareDescriptor {
     };
   }
 }
+// Account-wide Workers AI usage from the GraphQL Analytics API (dataset aiInferenceAdaptiveGroups,
+// sum.totalNeurons). Needs a separate read-only token with "Account Analytics: Read".
+export const NEURONS_QUERY = `query Neurons($account: string!, $start: Time!, $end: Time!) {
+  viewer { accounts(filter: { accountTag: $account }) {
+    aiInferenceAdaptiveGroups(limit: 10, filter: { datetime_geq: $start, datetime_lt: $end }) {
+      sum { totalNeurons }
+    }
+  } }
+}`;
+export class CloudflareUsage {
+  account: string;
+  secret: string;
+  fetch: typeof fetch;
+  constructor(account: string, secret: string, fetcher: typeof fetch = fetch) {
+    this.account = account;
+    this.secret = secret;
+    this.fetch = fetcher;
+  }
+  async neuronsUsed(start: Date, end: Date) {
+    const response = await this.fetch('https://api.cloudflare.com/client/v4/graphql', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.secret}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: NEURONS_QUERY,
+        variables: { account: this.account, start: start.toISOString(), end: end.toISOString() },
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!response.ok) throw new Error(`Analytics request failed (${response.status}).`);
+    // GraphQL reports errors with HTTP 200.
+    const json = (await response.json()) as {
+      data?: {
+        viewer?: {
+          accounts?: { aiInferenceAdaptiveGroups?: { sum?: { totalNeurons?: number } }[] }[];
+        };
+      };
+      errors?: unknown[] | null;
+    };
+    const accounts = json.data?.viewer?.accounts;
+    if (json.errors?.length || !Array.isArray(accounts) || accounts.length !== 1)
+      throw new Error('Analytics query returned errors.');
+    // No inference today yields an empty list.
+    return (accounts[0].aiInferenceAdaptiveGroups ?? []).reduce(
+      (total, row) => total + Number(row.sum?.totalNeurons ?? 0),
+      0,
+    );
+  }
+}
