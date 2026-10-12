@@ -3,14 +3,48 @@ export interface ImageStore {
   get(key: string): Promise<Buffer>;
   delete(key: string): Promise<void>;
 }
+// Adapters expose their provider ("AI application") name and the parameters sent with every
+// request (excluding prompt and image) so the pipeline can record exactly what was called.
+export type ProviderMetadata = {
+  modelVersion?: string | null;
+  usage?: Record<string, unknown> | null;
+};
 export interface ImageDescriptor {
+  provider: string;
   model: string;
-  describe(image: Buffer, model?: string): Promise<string>;
+  params: Record<string, unknown>;
+  describe(
+    image: Buffer,
+    prompt: string,
+    model?: string,
+  ): Promise<ProviderMetadata & { text: string }>;
 }
 export interface ImageGenerator {
+  provider: string;
   model: string;
-  generate(description: string, model?: string): Promise<Buffer>;
+  params: Record<string, unknown>;
+  // Receives the exact final prompt text only; never original bytes or an image URL.
+  generate(prompt: string, model?: string): Promise<ProviderMetadata & { image: Buffer }>;
 }
+export type Step = 'describe' | 'generate';
+export type PromptTemplate = {
+  id: number;
+  step: Step;
+  name: string;
+  version: number;
+  text: string;
+  created_at: number;
+  active: number;
+};
+export type ImageMetrics = {
+  width: number;
+  height: number;
+  dhash: string;
+  brightness: number;
+  contrast: number;
+  sharpness: number;
+  colorfulness: number;
+};
 export class HttpError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -42,6 +76,9 @@ export type Question = {
   generatorModel?: string;
   descriptorUnits?: number;
   generatorUnits?: number;
+  created?: number;
+  descriptorTemplate?: number;
+  generatorTemplate?: number;
 };
 export type Game = {
   id: string;

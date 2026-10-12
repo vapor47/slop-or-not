@@ -8,6 +8,7 @@ import { Auth } from '../src/auth.ts';
 import { app } from '../src/server.ts';
 import { Pipeline } from '../src/pipeline.ts';
 import type { ImageStore, Question } from '../src/types.ts';
+import { fakeDescriptor, fakeGenerator } from './helpers.ts';
 test('HTTP creator login → upload → processing → invite → play → score and replay', async () => {
   const repo = new Repository(':memory:', 10000);
   const files = new Map<string, Buffer>();
@@ -28,19 +29,11 @@ test('HTTP creator login → upload → processing → invite → play → score
   const pipe = new Pipeline(
     repo,
     store,
-    {
-      model: 'descriptor-test',
-      async describe() {
-        return 'A realistic cat photo';
-      },
-    },
-    {
-      model: 'generator-test',
-      async generate(text) {
-        assert.equal(text, 'A realistic cat photo');
-        return Buffer.from('fake');
-      },
-    },
+    fakeDescriptor(async () => 'A realistic cat photo', 'descriptor-test'),
+    fakeGenerator(async (text) => {
+      assert.equal(text, 'A natural, realistic photograph. A realistic cat photo');
+      return Buffer.from('fake');
+    }, 'generator-test'),
     normalize,
   );
   const hash = 'test:' + scryptSync('test-password', 'test', 64).toString('hex');

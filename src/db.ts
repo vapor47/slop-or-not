@@ -1,9 +1,46 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes, randomInt } from 'node:crypto';
 import { HttpError } from './types.ts';
-import type { Game, Question, Play } from './types.ts';
+import type { Game, Question, Play, PromptTemplate, Step, ImageMetrics } from './types.ts';
+import { DEFAULT_TEMPLATES } from './prompts.ts';
 export const WEEK = 7 * 86400000;
 export const token = () => randomBytes(24).toString('base64url');
+type Value = string | number | null;
+export type QuestionAnalytics = Partial<
+  Record<
+    | 'created_at'
+    | 'uploaded_at'
+    | 'described_at'
+    | 'ready_at'
+    | 'failed_at'
+    | 'removed_at'
+    | 'describe_template_id'
+    | 'generate_template_id'
+    | 'describe_run_id'
+    | 'generate_run_id'
+    | 'dhash_distance',
+    number | null
+  >
+>;
+export type RunStart = {
+  step: Step;
+  provider: string;
+  model: string;
+  template: number;
+  prompt: string;
+  params: Record<string, unknown>;
+  reservedUnits: number;
+  appVersion: string;
+};
+export type RunFinish = {
+  finished: number | null;
+  status: 'succeeded' | 'failed';
+  errorKind?: 'temporary' | 'permanent' | null;
+  error?: string | null;
+  modelVersion?: string | null;
+  usage?: Record<string, unknown> | null;
+  output?: string | null;
+};
 export class Repository {
   db: DatabaseSync;
   dailyBudget: number;
@@ -31,6 +68,151 @@ export class Repository {
       CREATE TABLE IF NOT EXISTS garbage(key TEXT PRIMARY KEY, delete_after INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS login_limits(ip TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL);`);
+    // Analytics tables are append-only and are never touched by expiry; see README "Analytics and retention".
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS prompt_templates(id INTEGER PRIMARY KEY AUTOINCREMENT,
+        step TEXT NOT NULL CHECK(step IN ('describe','generate')), name TEXT NOT NULL, version INTEGER NOT NULL,
+        text TEXT NOT NULL, created_at INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1, UNIQUE(step, name, version));
+      CREATE TRIGGER IF NOT EXISTS prompt_templates_immutable BEFORE UPDATE OF step, name, version, text ON prompt_templates
+        BEGIN SELECT RAISE(ABORT, 'Prompt templates are immutable; add a new version.'); END;
+      CREATE TRIGGER IF NOT EXISTS prompt_templates_kept BEFORE DELETE ON prompt_templates
+        BEGIN SELECT RAISE(ABORT, 'Prompt templates are kept for attribution; deactivate instead.'); END;
+      CREATE TABLE IF NOT EXISTS generation_runs(id INTEGER PRIMARY KEY AUTOINCREMENT,
+        question_id TEXT NOT NULL, game_id TEXT NOT NULL, step TEXT NOT NULL, provider TEXT NOT NULL,
+        model_id TEXT NOT NULL, model_version TEXT, prompt_template_id INTEGER REFERENCES prompt_templates(id),
+        prompt_text TEXT NOT NULL, params_json TEXT NOT NULL, output_text TEXT, usage_json TEXT,
+        started_at INTEGER NOT NULL, finished_at INTEGER, latency_ms INTEGER, attempt INTEGER NOT NULL,
+        retry_cycle INTEGER NOT NULL, status TEXT NOT NULL, error_kind TEXT, error TEXT,
+        reserved_units INTEGER NOT NULL, app_version TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS generation_runs_question ON generation_runs(question_id);
+      CREATE TABLE IF NOT EXISTS question_analytics(question_id TEXT PRIMARY KEY, game_id TEXT NOT NULL,
+        created_at INTEGER, uploaded_at INTEGER, described_at INTEGER, ready_at INTEGER, failed_at INTEGER,
+        removed_at INTEGER, describe_template_id INTEGER REFERENCES prompt_templates(id),
+        generate_template_id INTEGER REFERENCES prompt_templates(id), describe_run_id INTEGER,
+        generate_run_id INTEGER, dhash_distance INTEGER);
+      CREATE INDEX IF NOT EXISTS question_analytics_game ON question_analytics(game_id);
+      CREATE TABLE IF NOT EXISTS image_metrics(question_id TEXT NOT NULL,
+        role TEXT NOT NULL CHECK(role IN ('original','generated')), run_id INTEGER, sha256 TEXT NOT NULL,
+        bytes INTEGER NOT NULL, width INTEGER, height INTEGER, dhash TEXT, brightness REAL, contrast REAL,
+        sharpness REAL, colorfulness REAL, measured_at INTEGER NOT NULL, PRIMARY KEY(question_id, role));`);
+    this.transaction(() => {
+      for (const step of ['describe', 'generate'] as const) {
+        const latest = this.db
+          .prepare(
+            'SELECT text FROM prompt_templates WHERE step=? AND name=? ORDER BY version DESC LIMIT 1',
+          )
+          .get(step, DEFAULT_TEMPLATES[step].name);
+        if (latest?.text !== DEFAULT_TEMPLATES[step].text)
+          this.addTemplate(step, DEFAULT_TEMPLATES[step].name, DEFAULT_TEMPLATES[step].text);
+      }
+    });
+  }
+  // Editing a prompt adds a new active version and deactivates older versions of the same name.
+  addTemplate(step: Step, name: string, text: string): PromptTemplate {
+    const row = this.db
+      .prepare('SELECT MAX(version) AS version FROM prompt_templates WHERE step=? AND name=?')
+      .get(step, name);
+    this.db.prepare('UPDATE prompt_templates SET active=0 WHERE step=? AND name=?').run(step, name);
+    const id = this.db
+      .prepare(
+        'INSERT INTO prompt_templates(step,name,version,text,created_at,active) VALUES(?,?,?,?,?,1)',
+      )
+      .run(step, name, Number(row?.version ?? 0) + 1, text, this.now()).lastInsertRowid;
+    return this.template(Number(id));
+  }
+  template(id: number): PromptTemplate {
+    const row = this.db.prepare('SELECT * FROM prompt_templates WHERE id=?').get(id);
+    if (!row) throw new Error(`Prompt template ${id} not found.`);
+    return { ...row } as PromptTemplate;
+  }
+  // Newest active template for new questions; falls back to the newest version if none is active.
+  activeTemplate(step: Step): PromptTemplate {
+    const row = this.db
+      .prepare('SELECT * FROM prompt_templates WHERE step=? ORDER BY active DESC, id DESC LIMIT 1')
+      .get(step);
+    return { ...row } as PromptTemplate;
+  }
+  track(q: Question, fields: QuestionAnalytics) {
+    this.db
+      .prepare('INSERT OR IGNORE INTO question_analytics(question_id, game_id) VALUES(?,?)')
+      .run(q.id, q.game);
+    const keys = Object.keys(fields) as (keyof QuestionAnalytics)[];
+    if (keys.length)
+      this.db
+        .prepare(
+          `UPDATE question_analytics SET ${keys.map((k) => `${k}=?`).join(',')} WHERE question_id=?`,
+        )
+        .run(...keys.map((k) => fields[k] ?? null), q.id);
+  }
+  startRun(q: Question, run: RunStart) {
+    return Number(
+      this.db
+        .prepare(
+          `INSERT INTO generation_runs(question_id,game_id,step,provider,model_id,prompt_template_id,prompt_text,
+          params_json,started_at,attempt,retry_cycle,status,reserved_units,app_version)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,'running',?,?)`,
+        )
+        .run(
+          q.id,
+          q.game,
+          run.step,
+          run.provider,
+          run.model,
+          run.template,
+          run.prompt,
+          JSON.stringify(run.params),
+          this.now(),
+          q.attempts,
+          q.manualRetries,
+          run.reservedUnits,
+          run.appVersion,
+        ).lastInsertRowid,
+    );
+  }
+  finishRun(id: number, run: RunFinish) {
+    this.db
+      .prepare(
+        `UPDATE generation_runs SET finished_at=?, latency_ms=?-started_at, status=?, error_kind=?, error=?,
+        model_version=?, usage_json=?, output_text=? WHERE id=?`,
+      )
+      .run(
+        run.finished,
+        run.finished,
+        run.status,
+        run.errorKind ?? null,
+        run.error ?? null,
+        run.modelVersion ?? null,
+        run.usage ? JSON.stringify(run.usage) : null,
+        run.output ?? null,
+        id,
+      );
+  }
+  saveMetrics(
+    q: Question,
+    role: 'original' | 'generated',
+    run: number | null,
+    hash: { sha256: string; bytes: number },
+    metrics: ImageMetrics | null,
+  ) {
+    const values: Value[] = [
+      q.id,
+      role,
+      run,
+      hash.sha256,
+      hash.bytes,
+      ...(
+        ['width', 'height', 'dhash', 'brightness', 'contrast', 'sharpness', 'colorfulness'] as const
+      ).map((k) => metrics?.[k] ?? null),
+      this.now(),
+    ];
+    this.db
+      .prepare(`INSERT OR REPLACE INTO image_metrics VALUES(${values.map(() => '?').join(',')})`)
+      .run(...values);
+  }
+  metrics(id: string, role: 'original' | 'generated') {
+    return this.db
+      .prepare('SELECT * FROM image_metrics WHERE question_id=? AND role=?')
+      .get(id, role);
   }
   transaction<T>(fn: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');
@@ -93,6 +275,8 @@ export class Repository {
       this.garbage(q.original);
       this.garbage(q.generated);
       this.db.prepare('DELETE FROM questions WHERE id=?').run(id);
+      // The upload never completed and no provider was called, so it is not an analysable question.
+      this.db.prepare('DELETE FROM question_analytics WHERE question_id=?').run(id);
     });
   }
   cost(q: Question, generationOnly = false) {
@@ -147,8 +331,17 @@ export class Repository {
         reservationDay,
         descriptorUnits: this.descriptorUnits,
         generatorUnits: this.generatorUnits,
+        created: this.now(),
+        // Snapshot prompt versions like model ids so later prompt edits do not affect this question.
+        descriptorTemplate: this.activeTemplate('describe').id,
+        generatorTemplate: this.activeTemplate('generate').id,
       };
       this.save('questions', q);
+      this.track(q, {
+        created_at: q.created,
+        describe_template_id: q.descriptorTemplate,
+        generate_template_id: q.generatorTemplate,
+      });
       return q;
     });
   }
@@ -178,6 +371,7 @@ export class Repository {
       this.game(q.game, true);
       for (const key of [q.original, q.generated]) this.garbage(key);
       this.db.prepare('DELETE FROM questions WHERE id=?').run(id);
+      this.track(q, { removed_at: this.now() });
     });
   }
   publish(id: string) {
@@ -261,6 +455,8 @@ export class Repository {
       return this.view(play);
     });
   }
+  // Live game state and images are removed; prompt_templates, generation_runs, question_analytics
+  // and image_metrics are deliberately retained.
   expire() {
     this.transaction(() => {
       for (const game of this.list<Game>('games')) {

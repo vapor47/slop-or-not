@@ -1,53 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Repository, WEEK } from '../src/db.ts';
 import { Pipeline } from '../src/pipeline.ts';
 import { ProviderError } from '../src/types.ts';
-import type { Question, Play, ImageStore } from '../src/types.ts';
-function fixture(budget = 10000) {
-  let time = Date.UTC(2026, 9, 12, 12);
-  const dir = mkdtempSync(join(tmpdir(), 'slop-test-'));
-  const repo = new Repository(join(dir, 'test.sqlite'), budget, () => time);
-  const close = () => {
-    repo.db.close();
-    rmSync(dir, { recursive: true, force: true });
-  };
-  const store: ImageStore & { files: Map<string, Buffer> } = {
-    files: new Map(),
-    async put(k, b) {
-      this.files.set(k, b);
-    },
-    async get(k) {
-      const b = this.files.get(k);
-      if (!b) throw new Error('not found');
-      return b;
-    },
-    async delete(k) {
-      this.files.delete(k);
-    },
-  };
-  return {
-    repo,
-    store,
-    dir,
-    close,
-    advance: (ms: number) => {
-      time += ms;
-    },
-  };
-}
-function ready(repo: Repository, count = 2) {
-  const game = repo.create('Test game');
-  for (let i = 0; i < count; i++) {
-    const q = repo.acceptUpload(game.id);
-    q.state = 'ready';
-    repo.save('questions', q);
-  }
-  return repo.publish(game.id);
-}
+import type { Question, Play } from '../src/types.ts';
+import { fixture, ready, fakeDescriptor, fakeGenerator } from './helpers.ts';
 test('correct scoring, duplicate answers and Next, refresh and replay', () => {
   const f = fixture();
   try {
@@ -158,23 +116,17 @@ test('temporary failures retry three times, manual retry resumes generator', asy
     let describes = 0,
       generates = 0,
       fail = true;
-    const descriptor = {
-      model: 'descriptor-v1',
-      async describe(b: Buffer) {
-        assert.equal(b.toString(), 'original');
-        describes++;
-        return 'A photo of a cat.';
-      },
-    };
-    const generator = {
-      model: 'generator-v1',
-      async generate(text: string) {
-        assert.equal(text, 'A photo of a cat.');
-        generates++;
-        if (fail) throw new ProviderError('Busy', true);
-        return Buffer.from('generated');
-      },
-    };
+    const descriptor = fakeDescriptor(async (b) => {
+      assert.equal(b.toString(), 'original');
+      describes++;
+      return 'A photo of a cat.';
+    }, 'descriptor-v1');
+    const generator = fakeGenerator(async (text) => {
+      assert.equal(text, 'A natural, realistic photograph. A photo of a cat.');
+      generates++;
+      if (fail) throw new ProviderError('Busy', true);
+      return Buffer.from('generated');
+    }, 'generator-v1');
     const pipeline = new Pipeline(f.repo, f.store, descriptor, generator, async (b) => b);
     await pipeline.tick();
     assert.equal(describes, 1);
@@ -208,18 +160,12 @@ test('permanent failures do not auto retry, manual retries are bounded', async (
     const pipe = new Pipeline(
       f.repo,
       f.store,
-      {
-        model: 'd',
-        async describe() {
-          throw new ProviderError('Access denied', false);
-        },
-      },
-      {
-        model: 'g',
-        async generate() {
-          throw new Error();
-        },
-      },
+      fakeDescriptor(async () => {
+        throw new ProviderError('Access denied', false);
+      }),
+      fakeGenerator(async () => {
+        throw new Error();
+      }),
       async (b) => b,
     );
     await pipe.tick();
@@ -245,18 +191,8 @@ test('durable job lease prevents double claim and resumes after restart', async 
     const pipe = new Pipeline(
       f.repo,
       f.store,
-      {
-        model: 'd',
-        async describe() {
-          return 'Saved description';
-        },
-      },
-      {
-        model: 'g',
-        async generate() {
-          return Buffer.from('y');
-        },
-      },
+      fakeDescriptor(async () => 'Saved description', 'd'),
+      fakeGenerator(async () => Buffer.from('y'), 'g'),
       async (b) => b,
     );
     assert.ok(pipe.claim());
@@ -282,18 +218,8 @@ test('expiration blocks plays and images and schedules deletion for drafts and g
     const pipe = new Pipeline(
       f.repo,
       f.store,
-      {
-        model: 'd',
-        async describe() {
-          return 'x';
-        },
-      },
-      {
-        model: 'g',
-        async generate() {
-          return Buffer.from('x');
-        },
-      },
+      fakeDescriptor(async () => 'x', 'd'),
+      fakeGenerator(async () => Buffer.from('x'), 'g'),
       async (b) => b,
     );
     await pipe.cleanup();
@@ -316,20 +242,13 @@ test('removed in-flight generations cannot recreate a question or leave images',
     const pipe = new Pipeline(
       f.repo,
       f.store,
-      {
-        model: 'd',
-        async describe() {
-          return 'x';
-        },
-      },
-      {
-        model: 'g',
-        generate() {
-          return new Promise<Buffer>((r) => {
+      fakeDescriptor(async () => 'x', 'd'),
+      fakeGenerator(
+        () =>
+          new Promise<Buffer>((r) => {
             finish = r;
-          });
-        },
-      },
+          }),
+      ),
       async (b) => b,
     );
     const pending = pipe.tick();
@@ -373,19 +292,11 @@ test('jobs reserve new-day capacity before provider calls after rollover', async
     const pipe = new Pipeline(
       f.repo,
       f.store,
-      {
-        model: 'd',
-        async describe() {
-          calls++;
-          return 'x';
-        },
-      },
-      {
-        model: 'g',
-        async generate() {
-          return Buffer.from('x');
-        },
-      },
+      fakeDescriptor(async () => {
+        calls++;
+        return 'x';
+      }),
+      fakeGenerator(async () => Buffer.from('x'), 'g'),
       async (b) => b,
     );
     assert.equal(await pipe.tick(), false);
