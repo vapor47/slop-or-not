@@ -49,8 +49,14 @@ export class MeteredStore implements ImageStore {
     this.cache = cache;
   }
   async put(key: string, bytes: Buffer) {
-    this.quota.reservePut(key, bytes.length);
-    await this.inner.put(key, bytes);
+    const ticket = this.quota.reservePut(key, bytes.length);
+    try {
+      await this.inner.put(key, bytes);
+    } catch (e) {
+      this.quota.failPut(key);
+      throw e;
+    }
+    this.quota.confirmPut(key, bytes.length, ticket);
     this.cache.set(key, bytes);
   }
   async get(key: string) {

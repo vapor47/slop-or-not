@@ -98,8 +98,62 @@ test('a failed put keeps its byte reservation; overwriting a key is not double c
     await assert.rejects(store.put('k', Buffer.alloc(100)));
     assert.equal(f.repo.quota.storedBytes(), 100);
     assert.equal(f.repo.quota.used('r2_class_a'), 1);
+    // The 100-byte object may still be in R2 after a failed smaller overwrite.
     await assert.rejects(store.put('k', Buffer.alloc(40)));
+    assert.equal(f.repo.quota.storedBytes(), 100);
+    await store.delete('k');
+    assert.equal(f.repo.quota.storedBytes(), 0);
+  } finally {
+    f.close();
+  }
+});
+test('overwrites shrink the byte reservation only after a confirmed, non-overlapping put', async () => {
+  const f = fixture(10000, { storedBytes: 150 });
+  try {
+    let fail = false;
+    const gates: (() => void)[] = [];
+    let hold = false;
+    const store = new MeteredStore(
+      {
+        put: async (k, b) => {
+          if (hold) await new Promise<void>((r) => gates.push(r));
+          if (fail) throw new Error('network');
+          await f.store.put(k, b);
+        },
+        get: async (k) => f.store.get(k),
+        delete: async (k) => f.store.delete(k),
+      },
+      f.repo.quota,
+      new ImageCache(0),
+    );
+    await store.put('k', Buffer.alloc(100));
+    fail = true;
+    await assert.rejects(store.put('k', Buffer.alloc(40)));
+    // R2 still holds 100 bytes, so a 60-byte upload elsewhere would exceed the 150-byte cap.
+    assert.equal(f.store.files.get('k')!.length, 100);
+    assert.equal(f.repo.quota.storedBytes(), 100);
+    await assert.rejects(store.put('other', Buffer.alloc(60)), /storage is full/);
+    // A confirmed smaller overwrite releases the difference.
+    fail = false;
+    await store.put('k', Buffer.alloc(40));
     assert.equal(f.repo.quota.storedBytes(), 40);
+    // Overlapping puts to one key keep the larger size, even when both succeed.
+    hold = true;
+    const big = store.put('k', Buffer.alloc(90)),
+      small = store.put('k', Buffer.alloc(30));
+    assert.equal(f.repo.quota.storedBytes(), 90);
+    hold = false;
+    gates.splice(0).forEach((open) => open());
+    await Promise.all([big, small]);
+    assert.equal(f.repo.quota.storedBytes(), 90);
+    // A delete racing an in-flight put keeps the record until a later delete.
+    hold = true;
+    const late = store.put('k', Buffer.alloc(20));
+    await store.delete('k');
+    assert.equal(f.repo.quota.storedBytes(), 90);
+    hold = false;
+    gates.splice(0).forEach((open) => open());
+    await late;
     await store.delete('k');
     assert.equal(f.repo.quota.storedBytes(), 0);
   } finally {

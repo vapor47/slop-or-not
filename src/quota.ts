@@ -64,11 +64,14 @@ export class Quota {
       CREATE TABLE IF NOT EXISTS quota_usage(metric TEXT NOT NULL, period TEXT NOT NULL,
         used INTEGER NOT NULL, PRIMARY KEY(metric, period));
       CREATE TABLE IF NOT EXISTS stored_objects(key TEXT PRIMARY KEY, bytes INTEGER NOT NULL,
-        stored_at INTEGER NOT NULL);
+        stored_at INTEGER NOT NULL, pending INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS neuron_calls(at INTEGER NOT NULL, day TEXT NOT NULL,
         units INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS neuron_calls_day ON neuron_calls(day, at);`);
+    // Only the app process writes objects; puts in flight before a restart are over. Their
+    // (larger) reservations stay until a later confirmed put or delete.
+    this.db.exec('UPDATE stored_objects SET pending=0 WHERE pending>0');
   }
   // Joins an enclosing transaction (acceptUpload, retry, claim) or opens its own.
   atomic<T>(fn: () => T): T {
@@ -142,26 +145,62 @@ export class Quota {
     const row = this.db.prepare('SELECT COALESCE(SUM(bytes),0) AS total FROM stored_objects').get();
     return Number(row?.total || 0);
   }
-  // Reserves one Class A operation and the object's bytes before an upload. A failed put keeps
-  // its record (over-counting is safe); the key is released when its deletion succeeds.
+  // Reserves one Class A operation and max(existing, new) bytes before an upload: until the put is
+  // confirmed, R2 may still hold the previous (possibly larger) object. Returns a ticket for
+  // confirmPut/failPut. A failed put keeps the larger figure (over-counting is safe).
   reservePut(key: string, bytes: number) {
-    this.atomic(() => {
+    return this.atomic(() => {
       if (this.setting('storage_read_only'))
         throw new QuotaError(503, 'Image storage is read-only right now. Try again later.');
-      const existing = this.db.prepare('SELECT bytes FROM stored_objects WHERE key=?').get(key);
-      if (this.storedBytes() - Number(existing?.bytes || 0) + bytes > this.limits.storedBytes)
+      const row = this.db.prepare('SELECT bytes, pending FROM stored_objects WHERE key=?').get(key),
+        existing = Number(row?.bytes || 0);
+      const reserved = Math.max(existing, bytes);
+      if (this.storedBytes() - existing + reserved > this.limits.storedBytes)
         throw new QuotaError(
           503,
           'Image storage is full. Remove games or wait for them to expire.',
         );
       this.reserve('r2_class_a', 1, 'Image uploads are paused until the storage allowance resets.');
       this.db
-        .prepare('INSERT OR REPLACE INTO stored_objects VALUES(?,?,?)')
-        .run(key, bytes, this.now());
+        .prepare(
+          `INSERT INTO stored_objects(key,bytes,stored_at,pending,seq) VALUES(?,?,?,1,1)
+          ON CONFLICT(key) DO UPDATE SET bytes=excluded.bytes, stored_at=excluded.stored_at,
+          pending=pending+1, seq=seq+1`,
+        )
+        .run(key, reserved, this.now());
+      return {
+        seq: Number(this.db.prepare('SELECT seq FROM stored_objects WHERE key=?').get(key)!.seq),
+        // Another put to this key was already in flight, so the final object is unknown.
+        overlapped: Number(row?.pending || 0) > 0,
+      };
     });
   }
+  // Shrinks to the confirmed size only when no other put to the key overlapped this one, since the
+  // final object is otherwise unknown. A missing row (deleted meanwhile) is re-recorded.
+  confirmPut(key: string, bytes: number, ticket: { seq: number; overlapped: boolean }) {
+    this.atomic(() => {
+      const row = this.db.prepare('SELECT pending, seq FROM stored_objects WHERE key=?').get(key);
+      if (!row) {
+        this.db
+          .prepare('INSERT INTO stored_objects(key,bytes,stored_at) VALUES(?,?,?)')
+          .run(key, bytes, this.now());
+        return;
+      }
+      const alone =
+        !ticket.overlapped && Number(row.pending) === 1 && Number(row.seq) === ticket.seq;
+      this.db
+        .prepare(
+          `UPDATE stored_objects SET pending=MAX(0,pending-1)${alone ? ', bytes=?' : ''} WHERE key=?`,
+        )
+        .run(...(alone ? [bytes, key] : [key]));
+    });
+  }
+  failPut(key: string) {
+    this.db.prepare('UPDATE stored_objects SET pending=MAX(0,pending-1) WHERE key=?').run(key);
+  }
+  // After a successful delete. A put still in flight may land afterwards, so its row is kept.
   forget(key: string) {
-    this.db.prepare('DELETE FROM stored_objects WHERE key=?').run(key);
+    this.db.prepare('DELETE FROM stored_objects WHERE key=? AND pending=0').run(key);
   }
   setting(key: 'generation_disabled' | 'storage_read_only') {
     const row = this.db.prepare('SELECT value FROM settings WHERE key=?').get(key);
